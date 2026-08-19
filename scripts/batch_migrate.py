@@ -33,6 +33,63 @@ def update_page_markdown(page_id, markdown):
         return False
     return True
 
+import base64
+
+def notion_upload_images(image_srcs):
+    """原生上传 base64 图片到 Notion，返回 {placeholder_url: file_upload_id}"""
+    result = {}
+    for i, (src, link, ext) in enumerate(image_srcs):
+        if not src or not src.startswith('data:image/'):
+            continue
+        b64 = src.split(',', 1)[1] if ',' in src else src
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            continue
+        if not raw:
+            continue
+        r1 = requests.post('https://api.notion.com/v1/file_uploads',
+            headers=NOTION_HEADERS,
+            json={'mode': 'single_part', 'filename': f'img_{i}.{ext}', 'content_type': f'image/{ext}'},
+            timeout=60)
+        if r1.status_code not in (200, 201):
+            print(f"    [img] 创建上传失败 {r1.status_code}: {r1.text[:150]}")
+            continue
+        fu = r1.json()
+        r2 = requests.post(fu['upload_url'],
+            headers={'Authorization': f'Bearer {NOTION_TOKEN}', 'Notion-Version': '2026-03-11'},
+            files={'file': (f'img_{i}.{ext}', raw, f'image/{ext}')}, timeout=120)
+        if r2.status_code not in (200, 201):
+            print(f"    [img] 发送内容失败 {r2.status_code}: {r2.text[:150]}")
+            continue
+        placeholder = f'https://n2m.local/img_{i}.{ext}'
+        result[placeholder] = fu['id']
+    return result
+
+def notion_attach_images(page_id, upload_map, markdown):
+    """读回页面 blocks，把占位图 PATCH 成 file_upload 类型"""
+    r = requests.get(f'https://api.notion.com/v1/blocks/{page_id}/children',
+        headers=NOTION_HEADERS, timeout=60)
+    if r.status_code != 200:
+        print(f"    [img] 读 blocks 失败 {r.status_code}")
+        return 0
+    attached = 0
+    for b in r.json().get('results', []):
+        if b.get('type') != 'image':
+            continue
+        ext = (b.get('image') or {}).get('external') or {}
+        url = ext.get('url', '')
+        if url not in upload_map:
+            continue
+        fuid = upload_map[url]
+        r2 = requests.patch(f"https://api.notion.com/v1/blocks/{b['id']}", headers=NOTION_HEADERS,
+            json={'image': {'file_upload': {'id': fuid}}}, timeout=60)
+        if r2.status_code in (200, 201):
+            attached += 1
+        else:
+            print(f"    [img] PATCH 失败 {r2.status_code}: {r2.text[:150]}")
+    return attached
+
 URL_PATTERN = r'https?://[^\s"<>\')\]]+'
 DATA_FILE = '/tmp/yuque_entries.json'
 PROGRESS_FILE = '/tmp/batch_progress.txt'
@@ -176,7 +233,7 @@ for i, entry in enumerate(batch):
         break
     
     body = result.get('body', '')
-    markdown = lake_to_markdown(body)
+    markdown, img_list = lake_to_markdown(body)
     url = extract_url(body, entry['source'])
     tags = extract_tags(entry['title'], body, entry['source'], entry['category'])
     
@@ -186,7 +243,7 @@ for i, entry in enumerate(batch):
         '名称': {'title': [{'text': {'content': entry['title'][:2000]}}]},
         '来源': {'select': {'name': entry['source']}},
         '分类': {'select': {'name': entry['category']}},
-        '字数': {'number': entry['word_count']},
+        '字数': {'number': result.get('word_count', 0)},
         '标签': {'multi_select': [{'name': t} for t in tags[:15]]},
         '原文链接': {'url': yuque_url}
     }
@@ -204,6 +261,11 @@ for i, entry in enumerate(batch):
         if len(markdown) > 50000:
             markdown = markdown[:50000] + "\n\n...（内容过长已截断）"
         update_page_markdown(page['id'], markdown)
+        if img_list:
+            upload_map = notion_upload_images(img_list)
+            if upload_map:
+                n = notion_attach_images(page['id'], upload_map, markdown)
+                if n: print(f"        [img] 已原生上传 {n} 张")
     
     tag_str = '/'.join(tags[:6])
     if len(tags) > 6: tag_str += f"...(+{len(tags)-6})"
