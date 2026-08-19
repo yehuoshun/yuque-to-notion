@@ -1,83 +1,71 @@
 import subprocess, json, urllib.parse, re, time, sys, os
+import requests
 from config import *
+from lake_convert import lake_to_markdown
+
+# Notion 直接 REST 调用（绕开 mcporter 命令行 ARG_MAX 限制）
+with open('/home/admin/.openclaw/secrets/credentials.env') as _f:
+    _env = _f.read()
+_m = re.search(r'NOTION_TOKEN[=:]\s*[\"\x27]?([^\"\x27\n]+)', _env)
+NOTION_TOKEN = _m.group(1).strip().strip('"').strip("'") if _m else ''
+NOTION_HEADERS = {
+    'Authorization': f'Bearer {NOTION_TOKEN}',
+    'Notion-Version': '2026-03-11',
+    'Content-Type': 'application/json'
+}
+
+def create_notion_page(props):
+    r = requests.post('https://api.notion.com/v1/pages',
+        headers=NOTION_HEADERS,
+        json={'parent': {'database_id': NOTION_DATABASE_ID}, 'properties': props}, timeout=60)
+    if r.status_code in (200, 201):
+        return r.json()
+    print(f"    [notion] 创建失败 {r.status_code}: {r.text[:200]}")
+    return None
+
+def update_page_markdown(page_id, markdown):
+    r = requests.patch(f'https://api.notion.com/v1/pages/{page_id}/markdown',
+        headers=NOTION_HEADERS,
+        json={'type': 'replace_content', 'replace_content': {'new_str': markdown, 'allow_deleting_content': True}},
+        timeout=120)
+    if r.status_code not in (200, 201):
+        print(f"    [notion] markdown 写入失败 {r.status_code}: {r.text[:200]}")
+        return False
+    return True
 
 URL_PATTERN = r'https?://[^\s"<>\')\]]+'
 DATA_FILE = '/tmp/yuque_entries.json'
 PROGRESS_FILE = '/tmp/batch_progress.txt'
 
-def mcpcall(tool, args):
+def mcpcall(tool, args, retries=3):
     cmd = ['mcporter', 'call', tool, '--args', json.dumps(args), '--output', 'json']
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        data = json.loads(r.stdout)
-        if isinstance(data, dict) and data.get('isError'): return None
-        return data
-    except: return None
+    # 必须固定 cwd：mcporter 按 cwd 找 MCP server 配置，/tmp 下找不到 yuque-mcp
+    MCP_CWD = '/home/admin/.openclaw/workspace'
+    for attempt in range(retries):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=45, cwd=MCP_CWD)
+            data = json.loads(r.stdout)
+            # 判断错误：isError 标志 / error 键（含 Unknown MCP server）/ status>=400
+            if isinstance(data, dict):
+                if data.get('isError'):
+                    print(f'    [mcp] {tool} isError, 重试 {attempt+1}/{retries}...')
+                    time.sleep(3)
+                    continue
+                if 'error' in data:
+                    print(f'    [mcp] {tool} error={str(data["error"])[:80]}, 重试 {attempt+1}/{retries}...')
+                    time.sleep(3)
+                    continue
+                if data.get('status') and isinstance(data.get('status'), (int, float)) and data['status'] >= 400:
+                    print(f'    [mcp] {tool} status={data["status"]}, 重试 {attempt+1}/{retries}...')
+                    time.sleep(3)
+                    continue
+            return data
+        except Exception as e:
+            print(f'    [mcp] {tool} 异常 {e}, 重试 {attempt+1}/{retries}...')
+            time.sleep(3)
+    return None
 
-def body_to_markdown(body):
-    if not body: return ""
-    decoded = urllib.parse.unquote(body)
-    
-    # Step 1: Replace card elements with markdown
-    # Code blocks
-    def replace_codeblock(m):
-        raw_val = m.group(1)
-        val = urllib.parse.unquote(raw_val)
-        if val.startswith('data:'): val = val[5:]
-        try:
-            d = json.loads(val)
-            code = d.get('code', '')
-            mode = d.get('mode', 'text')
-            if '%' in code: code = urllib.parse.unquote(code)
-            lang = mode if mode != 'plain' else ''
-            return f"```{lang}\n{code}\n```"
-        except:
-            return ''
-    
-    def replace_image(m):
-        raw_val = m.group(1)
-        val = urllib.parse.unquote(raw_val)
-        if val.startswith('data:'): val = val[5:]
-        try:
-            d = json.loads(val)
-            src = d.get('src', '')
-            link = d.get('link', '')
-            if src.startswith('data:'):
-                return '[图片]'
-            if link:
-                return f"[![图片]({src})]({link})"
-            return f"![图片]({src})"
-        except:
-            return '[图片]'
-    
-    # Process the raw body (URL-encoded)
-    # First replace codeblocks and images
-    result = re.sub(r'<card[^>]*name="codeblock"[^>]*value="([^"]*)"[^>]*>', replace_codeblock, body)
-    result = re.sub(r'<card[^>]*name="image"[^>]*value="([^"]*)"[^>]*>', replace_image, result)
-    result = re.sub(r'<card[^>]*>.*?</card>', '', result, flags=re.DOTALL)
-    result = re.sub(r'</?card[^>]*>', '', result)
-    
-    # Now URL-decode
-    result = urllib.parse.unquote(result)
-    
-    # Remove HTML tags but keep code blocks
-    lines = []
-    # Split into sections: code blocks and text
-    parts = re.split(r'(```.*?```)', result, flags=re.DOTALL)
-    for part in parts:
-        if part.startswith('```'):
-            # Code block - keep as-is
-            lines.append(part)
-        else:
-            # Regular text - extract from <p> tags or top-level text
-            # Remove remaining HTML tags
-            text = re.sub(r'<[^>]+>', ' ', part)
-            text = text.replace('&amp;','&').replace('&lt;','<').replace('&gt;','>').replace('&nbsp;',' ')
-            text = re.sub(r'\s+', ' ', text).strip()
-            if text and len(text) > 2:
-                lines.append(text)
-    
-    return '\n\n'.join(lines)
+# body_to_markdown 已由 lake_convert.lake_to_markdown 替代
 
 def extract_url(body, source):
     decoded = urllib.parse.unquote(body) if body else ""
@@ -177,14 +165,18 @@ for i, entry in enumerate(batch):
     result = mcpcall('yuque-mcp.yuque_web_get_doc', {
         'id': str(entry['doc_id']), 'book_id': YUQUE_BOOK_ID
     })
-    
-    if not result:
+    # web 接口限流时返回空 body：不重试轰炸，失败即停（避免把风控窗口填满）
+    if result is None:
         print(f"  [{idx}] FAIL: 读档失败 - {entry['title'][:50]}")
         results.append({'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50]})
         continue
+    if not result.get('body'):
+        print(f"  !! 风控触发（body 空）: 批次中止，静默恢复后重跑。进度保持 {start_idx}")
+        results.append({'idx': idx, 'status': 'RATE_LIMITED', 'title': entry['title'][:50]})
+        break
     
     body = result.get('body', '')
-    markdown = body_to_markdown(body)
+    markdown = lake_to_markdown(body)
     url = extract_url(body, entry['source'])
     tags = extract_tags(entry['title'], body, entry['source'], entry['category'])
     
@@ -201,10 +193,7 @@ for i, entry in enumerate(batch):
     if url:
         props['备注'] = {'rich_text': [{'text': {'content': f'原文出处: {url}'}}]}
     
-    page = mcpcall('notion-api.API-post-page', {
-        'parent': {'type': 'database_id', 'database_id': NOTION_DATABASE_ID},
-        'properties': props
-    })
+    page = create_notion_page(props)
     
     if not page or not page.get('id'):
         print(f"  [{idx}] FAIL: 创建页失败 - {entry['title'][:50]}")
@@ -214,11 +203,7 @@ for i, entry in enumerate(batch):
     if markdown:
         if len(markdown) > 50000:
             markdown = markdown[:50000] + "\n\n...（内容过长已截断）"
-        mcpcall('notion-api.API-update-page-markdown', {
-            'page_id': page['id'],
-            'type': 'replace_content',
-            'replace_content': {'new_str': markdown, 'allow_deleting_content': True}
-        })
+        update_page_markdown(page['id'], markdown)
     
     tag_str = '/'.join(tags[:6])
     if len(tags) > 6: tag_str += f"...(+{len(tags)-6})"
@@ -227,7 +212,7 @@ for i, entry in enumerate(batch):
     if url:
         print(f"        备注: 原文出处: {url}")
     results.append({'idx': idx, 'status': 'OK', 'title': entry['title'][:50], 'words': len(markdown), 'tags': len(tags)})
-    time.sleep(0.3)
+    time.sleep(20)
 
 # Save progress
 with open(PROGRESS_FILE, 'w') as f:
