@@ -17,15 +17,66 @@ def mcpcall(tool, args):
 def body_to_markdown(body):
     if not body: return ""
     decoded = urllib.parse.unquote(body)
-    paras = re.findall(r'<p[^>]*>(.*?)</p>', decoded, re.DOTALL)
+    
+    # Step 1: Replace card elements with markdown
+    # Code blocks
+    def replace_codeblock(m):
+        raw_val = m.group(1)
+        val = urllib.parse.unquote(raw_val)
+        if val.startswith('data:'): val = val[5:]
+        try:
+            d = json.loads(val)
+            code = d.get('code', '')
+            mode = d.get('mode', 'text')
+            if '%' in code: code = urllib.parse.unquote(code)
+            lang = mode if mode != 'plain' else ''
+            return f"```{lang}\n{code}\n```"
+        except:
+            return ''
+    
+    def replace_image(m):
+        raw_val = m.group(1)
+        val = urllib.parse.unquote(raw_val)
+        if val.startswith('data:'): val = val[5:]
+        try:
+            d = json.loads(val)
+            src = d.get('src', '')
+            link = d.get('link', '')
+            if src.startswith('data:'):
+                return '[图片]'
+            if link:
+                return f"[![图片]({src})]({link})"
+            return f"![图片]({src})"
+        except:
+            return '[图片]'
+    
+    # Process the raw body (URL-encoded)
+    # First replace codeblocks and images
+    result = re.sub(r'<card[^>]*name="codeblock"[^>]*value="([^"]*)"[^>]*>', replace_codeblock, body)
+    result = re.sub(r'<card[^>]*name="image"[^>]*value="([^"]*)"[^>]*>', replace_image, result)
+    result = re.sub(r'<card[^>]*>.*?</card>', '', result, flags=re.DOTALL)
+    result = re.sub(r'</?card[^>]*>', '', result)
+    
+    # Now URL-decode
+    result = urllib.parse.unquote(result)
+    
+    # Remove HTML tags but keep code blocks
     lines = []
-    for p in paras:
-        p = re.sub(r'<card[^>]*>.*?</card>', '', p, flags=re.DOTALL)
-        p = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>.*?</a>', r'\1', p)
-        p = re.sub(r'<[^>]+>', '', p)
-        p = p.replace('&amp;','&').replace('&lt;','<').replace('&gt;','>').replace('&nbsp;',' ')
-        p = re.sub(r'\s+', ' ', p).strip()
-        if p and len(p) > 2: lines.append(p)
+    # Split into sections: code blocks and text
+    parts = re.split(r'(```.*?```)', result, flags=re.DOTALL)
+    for part in parts:
+        if part.startswith('```'):
+            # Code block - keep as-is
+            lines.append(part)
+        else:
+            # Regular text - extract from <p> tags or top-level text
+            # Remove remaining HTML tags
+            text = re.sub(r'<[^>]+>', ' ', part)
+            text = text.replace('&amp;','&').replace('&lt;','<').replace('&gt;','>').replace('&nbsp;',' ')
+            text = re.sub(r'\s+', ' ', text).strip()
+            if text and len(text) > 2:
+                lines.append(text)
+    
     return '\n\n'.join(lines)
 
 def extract_url(body, source):
