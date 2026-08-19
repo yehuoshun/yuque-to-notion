@@ -108,7 +108,7 @@ def _ext_from_src(src):
 
 def lake_to_markdown(body):
     if not body:
-        return ""
+        return "", []
 
     code_blocks = []
     images = []  # (src, link, ext)
@@ -123,6 +123,23 @@ def lake_to_markdown(body):
         if '%' in code:
             code = urllib.parse.unquote(code)
         lang = LANG_MAP.get(mode, mode if len(mode) <= 15 else '')
+        # 嵌套代码块（code 内部含 ```）会让 Notion markdown 解析错乱吞掉图片行：
+        # 直接展开不包外层 fence，让内部 ``` 成为顶层代码块
+        if '```' in code:
+            lines = code.split('\n')
+            # 去掉外层围栏头尾（如 ```markdown ... ```）
+            if lines and lines[0].strip().startswith('```'):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == '```':
+                lines = lines[:-1]
+            # 配对检查：奇数个 fence → 从后往前删孤立行
+            fence_count = sum(1 for ln in lines if ln.strip().startswith('```'))
+            if fence_count % 2 == 1:
+                for i in range(len(lines) - 1, -1, -1):
+                    if lines[i].strip().startswith('```'):
+                        del lines[i]
+                        break
+            return '\n' + '\n'.join(lines) + '\n'
         code_blocks.append((lang, code))
         return f'\n\x01CODEBLOCK{len(code_blocks)-1}\x01\n'
 
@@ -187,12 +204,8 @@ def lake_to_markdown(body):
         if not src:
             return '[图片]'
         if src.startswith('data:image/'):
-            # base64 图片：解码上传图床
-            b64 = src.split(',', 1)[1] if ',' in src else src
-            up_url = upload_base64_image(b64, ext)
-            if not up_url:
-                return '[图片]'
-            src = up_url
+            # base64 图片：占位 URL，由 batch_migrate 原生上传后 PATCH 成 file_upload
+            return f'![图片](https://n2m.local/img_{idx}.{ext})'
         if link:
             return f'[![图片]({src})]({link})'
         return f'![图片]({src})'
@@ -200,7 +213,7 @@ def lake_to_markdown(body):
     result = re.sub(r'\x01CODEBLOCK(\d+)\x01', restore_codeblock, result)
     result = re.sub(r'\x01IMAGE(\d+)\x01', restore_image, result)
 
-    return result.strip()
+    return result.strip(), [(src, link, ext) for src, link, ext in images]
 
 def strip_tags(html):
     return re.sub(r'<[^>]+>', '', html).strip()
@@ -224,6 +237,6 @@ if __name__ == '__main__':
     doc = json.loads(r.stdout)
     body = doc.get('body', '')
     print(f"=== {doc.get('title')} ===")
-    md = lake_to_markdown(body)
-    print(f"=== markdown ({len(md)} chars) ===")
+    md, imgs = lake_to_markdown(body)
+    print(f"=== markdown ({len(md)} chars), images={len(imgs)} ===")
     print(md)
