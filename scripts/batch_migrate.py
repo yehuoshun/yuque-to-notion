@@ -162,6 +162,51 @@ def save_result(result_json):
     except Exception as e:
         print(f"    [save] 写盘失败: {e}")
 
+def doc_body_precheck(result, entry):
+    """文档预检：R1 二进制 / R2 数据库dump / R8 无意义内容。返回 (pass: bool, reason: str|None)"""
+    body = result.get('body', '')
+    word_count = result.get('word_count', 0)
+    if not body:
+        return False, 'R8_空body'
+
+    total = len(body)
+    # R1: 二进制 — 可读文本比例 < 5%，且无 lake card 标签
+    readable = len(re.findall(r'[\u4e00-\u9fff\w]{2,}', body))
+    has_card = '<card' in body
+    if not has_card and readable < max(5, total * 0.05) and total > 500:
+        return False, 'R1_二进制'
+
+    # R2: 数据库 dump — 10+ 条 SQL 模式
+    sql_lines = len(re.findall(r'(CREATE\s+TABLE|INSERT\s+INTO|DROP\s+TABLE|ALTER\s+TABLE|' +
+                                r'CREATE\s+INDEX|TRUNCATE\s+TABLE)', body, re.I))
+    if sql_lines > 10:
+        return False, 'R2_数据库dump'
+
+    # R8: 无意义内容 — 可读字符 < 10 且 word_count < 5，且无 card
+    if not has_card and readable < 10 and word_count < 5:
+        return False, 'R8_无意义内容'
+
+    return True, None
+
+
+def check_notion_exists(yuque_url):
+    """查 Notion 数据库是否有 原文链接=yuque_url 的记录"""
+    r = requests.post(
+        f'https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query',
+        headers=NOTION_HEADERS,
+        json={
+            'filter': {
+                'property': '原文链接',
+                'url': {'equals': yuque_url}
+            }
+        },
+        timeout=30
+    )
+    if r.status_code != 200:
+        return False  # 查失败不拦截，宁可重复不可漏
+    return len(r.json().get('results', [])) > 0
+
+
 def extract_url(body, source):
     decoded = urllib.parse.unquote(body) if body else ""
     urls = re.findall(URL_PATTERN, decoded)
@@ -287,6 +332,17 @@ for i, entry in enumerate(batch):
         continue
 
     body = result.get('body', '')
+
+    # 文档预检：R1 二进制 / R2 数据库dump / R8 无意义内容
+    precheck_pass, precheck_reason = doc_body_precheck(result, entry)
+    if not precheck_pass:
+        print(f"  [{idx}] SKIP ({precheck_reason}) - {entry['title'][:50]}")
+        entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
+                        'doc_id': doc_id, 'reason': precheck_reason}
+        results.append(entry_result)
+        save_result(entry_result)
+        continue
+
     markdown, img_list = lake_to_markdown(body)
     url = extract_url(body, entry['source'])
     tags = extract_tags(entry['title'], body, entry['source'], entry['category'])
@@ -303,6 +359,15 @@ for i, entry in enumerate(batch):
     }
     if url:
         props['备注'] = {'rich_text': [{'text': {'content': f'原文出处: {url}'}}]}
+
+    # 去重：查 Notion 是否已有同原文链接的记录
+    if check_notion_exists(yuque_url):
+        print(f"  [{idx}] SKIP（Notion 已存在）- {entry['title'][:50]}")
+        entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
+                        'doc_id': doc_id, 'reason': 'notion_exists'}
+        results.append(entry_result)
+        save_result(entry_result)
+        continue
 
     page = create_notion_page(props)
 
