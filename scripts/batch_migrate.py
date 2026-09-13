@@ -325,32 +325,72 @@ def extract_tags(title, body, source, category):
 
 # ── 主流程 ──
 
-start_idx = 0
-if os.path.exists(PROGRESS_FILE):
-    with open(PROGRESS_FILE) as f:
-        start_idx = int(f.read().strip())
+# ── 模式解析：new / resume（默认） / retry-failed ──
+MODE = 'resume'
+for arg in sys.argv[1:]:
+    if arg == '--mode':
+        continue
+    if arg in ('new', 'resume', 'retry-failed'):
+        MODE = arg
 
+if MODE == 'new':
+    for f in [PROGRESS_FILE, PREV_RESULTS_FILE]:
+        if os.path.exists(f):
+            os.remove(f)
+            print(f"[mode=new] 已清除 {f}")
+    print('[mode=new] 从头开始')
+
+start_idx = 0
 processed_ids = set()
-if os.path.exists(PREV_RESULTS_FILE):
-    try:
-        with open(PREV_RESULTS_FILE) as f:
-            for r in json.load(f):
-                if r.get('status') == 'OK':
-                    processed_ids.add(r.get('doc_id', ''))
-    except Exception:
-        pass
+failed_ids = []  # 仅 retry-failed 使用
+
+if MODE == 'retry-failed':
+    # 从已有结果里挑出失败的 doc_id
+    if os.path.exists(PREV_RESULTS_FILE):
+        try:
+            with open(PREV_RESULTS_FILE) as f:
+                for r in json.load(f):
+                    if r.get('status') in ('FAIL', 'RATE_LIMITED'):
+                        failed_ids.append(r.get('doc_id', ''))
+        except Exception:
+            pass
+    print(f'[mode=retry-failed] 待重试: {len(failed_ids)} 篇')
+else:
+    # resume / new: 从进度文件读索引起点
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE) as f:
+            start_idx = int(f.read().strip())
+
+    # 加载已成功的 doc_id（resume 时跳过，new 时不起作用因为文件已删）
+    if os.path.exists(PREV_RESULTS_FILE):
+        try:
+            with open(PREV_RESULTS_FILE) as f:
+                for r in json.load(f):
+                    if r.get('status') == 'OK':
+                        processed_ids.add(r.get('doc_id', ''))
+        except Exception:
+            pass
 
 with open(DATA_FILE) as f:
     entries = json.load(f)
 
-end_idx = min(start_idx + BATCH_SIZE, len(entries))
-batch = entries[start_idx:end_idx]
+# 构建批次：resume/new 按索引连续取；retry-failed 只取失败的那些
+if MODE == 'retry-failed':
+    batch = [e for e in entries if str(e['doc_id']) in failed_ids]
+    # retry-failed 不计入进度文件索引，批次完成后不推进 start_idx
+    end_idx = start_idx + len(batch)
+    if not batch:
+        print("ALL_DONE (no failed docs to retry)")
+        sys.exit(0)
+    print(f"RETRY-FAILED BATCH: {len(batch)}/{len(entries)} docs")
+else:
+    end_idx = min(start_idx + BATCH_SIZE, len(entries))
+    batch = entries[start_idx:end_idx]
+    if not batch:
+        print("ALL_DONE")
+        sys.exit(0)
+    print(f"BATCH: {start_idx}-{end_idx-1}/{len(entries)}")
 
-if not batch:
-    print("ALL_DONE")
-    sys.exit(0)
-
-print(f"BATCH: {start_idx}-{end_idx-1}/{len(entries)}")
 print()
 
 results = []
@@ -482,16 +522,20 @@ for i, entry in enumerate(batch):
     time.sleep(20)
 
 # ───── 保存进度 ─────
-actually_consumed = sum(1 for r in results if r['status'] != 'SKIP')
-next_start = start_idx + actually_consumed
-with open(PROGRESS_FILE, 'w') as f:
-    f.write(str(next_start))
-
 ok = sum(1 for r in results if r['status'] == 'OK')
 skipped = sum(1 for r in results if r['status'] == 'SKIP')
 failed = sum(1 for r in results if r['status'] in ('FAIL', 'RATE_LIMITED'))
-print(f"\nDONE: start={start_idx} | OK={ok} FAIL={failed} SKIP(已迁移)={skipped} | 下次: {next_start}")
-if next_start >= len(entries):
-    print("ALL_DONE")
+
+if MODE == 'retry-failed':
+    # retry-failed 不推进索引进度（不影响 normal 的批次位置）
+    print(f"\nDONE: retry-failed | OK={ok} FAIL={failed} SKIP={skipped}")
 else:
-    print(f"NEXT: {next_start}/{len(entries)}")
+    actually_consumed = sum(1 for r in results if r['status'] != 'SKIP')
+    next_start = start_idx + actually_consumed
+    with open(PROGRESS_FILE, 'w') as f:
+        f.write(str(next_start))
+    print(f"\nDONE: start={start_idx} | OK={ok} FAIL={failed} SKIP(已迁移)={skipped} | 下次: {next_start}")
+    if next_start >= len(entries):
+        print("ALL_DONE")
+    else:
+        print(f"NEXT: {next_start}/{len(entries)}")
