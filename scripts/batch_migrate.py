@@ -92,7 +92,8 @@ def notion_attach_images(page_id, upload_map, markdown):
 
 URL_PATTERN = r'https?://[^\s"<>\')\]]+'
 DATA_FILE = '/tmp/yuque_entries.json'
-PROGRESS_FILE = '/tmp/batch_progress.txt'
+PROGRESS_FILE = '/tmp/yuque_batch_progress.txt'
+PREV_RESULTS_FILE = '/tmp/yuque_prev_results.json'
 
 def mcpcall(tool, args, retries=3):
     cmd = ['mcporter', 'call', tool, '--args', json.dumps(args), '--output', 'json']
@@ -122,7 +123,44 @@ def mcpcall(tool, args, retries=3):
             time.sleep(3)
     return None
 
-# body_to_markdown 已由 lake_convert.lake_to_markdown 替代
+def fetch_doc_with_retry(entry, book_id, max_retries=2):
+    """取单篇文档，body 空时渐进退避。返回 (result_dict, failure_reason)"""
+    for attempt in range(max_retries + 1):
+        result = mcpcall('yuque-mcp.yuque_web_get_doc', {
+            'id': str(entry['doc_id']), 'book_id': book_id
+        })
+        # None = 网络/超时/系统错误
+        if result is None:
+            if attempt < max_retries:
+                print(f"    [retry] 网络异常, 等 10s 后重试 ({attempt+1}/{max_retries})")
+                time.sleep(10)
+            continue
+        # 正常结果：有 body
+        if result.get('body'):
+            return result, None
+        # body 空 = 风控限流：等更久再重试
+        if attempt == 0:
+            print(f"    [retry] body 空（疑似风控）, 等 30s 后重试")
+            time.sleep(30)
+        else:
+            print(f"    [retry] body 仍空, 等 60s 后重试 ({attempt+1}/{max_retries})")
+            time.sleep(60)
+    return None, 'RATE_LIMITED'
+
+def save_result(result_json):
+    """每篇处理完立即写盘，进程中断不丢结果"""
+    tmp_path = PREV_RESULTS_FILE + '.tmp'
+    try:
+        existing = []
+        if os.path.exists(PREV_RESULTS_FILE):
+            with open(PREV_RESULTS_FILE) as f:
+                existing = json.load(f)
+        existing.append(result_json)
+        with open(tmp_path, 'w') as f:
+            json.dump(existing, f, ensure_ascii=False, indent=1)
+        os.replace(tmp_path, PREV_RESULTS_FILE)
+    except Exception as e:
+        print(f"    [save] 写盘失败: {e}")
 
 def extract_url(body, source):
     decoded = urllib.parse.unquote(body) if body else ""
@@ -149,7 +187,7 @@ def extract_tags(title, body, source, category):
     decoded = urllib.parse.unquote(body) if body else ""
     text = re.sub(r'<[^>]+>', ' ', decoded)
     text = re.sub(r'\s+', ' ', text).strip()
-    
+
     # Clean title: remove all special chars, split into words
     # Handle compound terms (e.g. MyBatis-Plus -> MybatisPlus)
     ctitle = title
@@ -161,10 +199,10 @@ def extract_tags(title, body, source, category):
         w = w.strip('+-./ ').strip()
         if len(w) >= 2 and len(w) <= 20:
             keywords.append(w)
-    
+
     src_tags = {'博客园': ['博客园'], 'LINUX DO': ['LINUX DO'], 'Bangumi': ['Bangumi'], 'B站': ['B站'], '小黑盒': ['小黑盒']}
     if source in src_tags: keywords.extend(src_tags[source])
-    
+
     cat_tags = {
         'AI/大模型': ['AI','大模型'], '编程技术': ['编程','开发'], '操作系统': ['系统','操作系统'],
         '安全': ['安全'], '影视/动漫': ['影视','动漫'], '日记/随笔': ['日记','随笔'],
@@ -172,7 +210,7 @@ def extract_tags(title, body, source, category):
         '游戏': ['游戏'], '音乐制作': ['音乐'], '福利/羊毛': ['福利','羊毛']
     }
     if category in cat_tags: keywords.extend(cat_tags[category])
-    
+
     tech = re.findall(
         r'(Python|Java|JavaScript|TypeScript|Go|Rust|SQL|Docker|Kubernetes|K8s|'
         r'Git|React|Vue|Node\.?js|Linux|Windows|Ubuntu|CentOS|'
@@ -184,7 +222,7 @@ def extract_tags(title, body, source, category):
         r'PostgreSQL|MongoDB|MariaDB|Oracle|SQLite|Hadoop|Spark|Flink|Hive)',
         text, re.IGNORECASE)
     keywords.extend(tech)
-    
+
     seen = set()
     result = []
     for k in keywords:
@@ -203,6 +241,17 @@ if os.path.exists(PROGRESS_FILE):
     with open(PROGRESS_FILE) as f:
         start_idx = int(f.read().strip())
 
+# Load already-processed doc_ids for skip-on-exist
+processed_ids = set()
+if os.path.exists(PREV_RESULTS_FILE):
+    try:
+        with open(PREV_RESULTS_FILE) as f:
+            for r in json.load(f):
+                if r.get('status') == 'OK':
+                    processed_ids.add(r.get('doc_id', ''))
+    except Exception:
+        pass
+
 with open(DATA_FILE) as f:
     entries = json.load(f)
 
@@ -219,26 +268,31 @@ print()
 results = []
 for i, entry in enumerate(batch):
     idx = start_idx + i
-    result = mcpcall('yuque-mcp.yuque_web_get_doc', {
-        'id': str(entry['doc_id']), 'book_id': YUQUE_BOOK_ID
-    })
-    # web 接口限流时返回空 body：不重试轰炸，失败即停（避免把风控窗口填满）
-    if result is None:
-        print(f"  [{idx}] FAIL: 读档失败 - {entry['title'][:50]}")
-        results.append({'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50]})
+    doc_id = str(entry['doc_id'])
+
+    # 去重：已成功迁移的跳过
+    if doc_id in processed_ids:
+        print(f"  [{idx}] SKIP（已迁移）- {entry['title'][:50]}")
+        results.append({'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50], 'doc_id': doc_id})
         continue
-    if not result.get('body'):
-        print(f"  !! 风控触发（body 空）: 批次中止，静默恢复后重跑。进度保持 {start_idx}")
-        results.append({'idx': idx, 'status': 'RATE_LIMITED', 'title': entry['title'][:50]})
-        break
-    
+
+    # 取文档（含渐进退避：网络异常→10s, body空→30s/60s, 最多重试2次）
+    result, fail_reason = fetch_doc_with_retry(entry, YUQUE_BOOK_ID)
+    if result is None:
+        status = fail_reason or 'FAIL'
+        print(f"  [{idx}] {status}: {entry['title'][:50]}")
+        entry_result = {'idx': idx, 'status': status, 'title': entry['title'][:50], 'doc_id': doc_id}
+        results.append(entry_result)
+        save_result(entry_result)
+        continue
+
     body = result.get('body', '')
     markdown, img_list = lake_to_markdown(body)
     url = extract_url(body, entry['source'])
     tags = extract_tags(entry['title'], body, entry['source'], entry['category'])
-    
+
     yuque_url = f'https://www.yuque.com/{YUQUE_USER}/{YUQUE_NAMESPACE}/{result.get("slug", "")}'
-    
+
     props = {
         '名称': {'title': [{'text': {'content': entry['title'][:2000]}}]},
         '来源': {'select': {'name': entry['source']}},
@@ -249,14 +303,17 @@ for i, entry in enumerate(batch):
     }
     if url:
         props['备注'] = {'rich_text': [{'text': {'content': f'原文出处: {url}'}}]}
-    
+
     page = create_notion_page(props)
-    
+
     if not page or not page.get('id'):
         print(f"  [{idx}] FAIL: 创建页失败 - {entry['title'][:50]}")
-        results.append({'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50]})
+        entry_result = {'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50],
+                        'doc_id': doc_id, 'reason': 'create_page_failed'}
+        results.append(entry_result)
+        save_result(entry_result)
         continue
-    
+
     if markdown:
         if len(markdown) > 50000:
             markdown = markdown[:50000] + "\n\n...（内容过长已截断）"
@@ -266,21 +323,31 @@ for i, entry in enumerate(batch):
             if upload_map:
                 n = notion_attach_images(page['id'], upload_map, markdown)
                 if n: print(f"        [img] 已原生上传 {n} 张")
-    
+
     tag_str = '/'.join(tags[:6])
     if len(tags) > 6: tag_str += f"...(+{len(tags)-6})"
     print(f"  [{idx}] OK | {entry['category']:8s} | {len(markdown):5d}字 | TAGS: {tag_str}")
     print(f"        原文链接: https://www.yuque.com/yehuoshun/twpgac/{result.get('slug', '')}")
     if url:
         print(f"        备注: 原文出处: {url}")
-    results.append({'idx': idx, 'status': 'OK', 'title': entry['title'][:50], 'words': len(markdown), 'tags': len(tags)})
+    entry_result = {'idx': idx, 'status': 'OK', 'title': entry['title'][:50], 'doc_id': doc_id,
+                    'words': len(markdown), 'tags': len(tags)}
+    results.append(entry_result)
+    save_result(entry_result)
     time.sleep(20)
 
-# Save progress
+# Save progress: 实际消耗了多少篇（skip已迁移的不算消耗）
+# 避免风控跳过导致进度跳空丢文档
+actually_consumed = sum(1 for r in results if r['status'] != 'SKIP')
+next_start = start_idx + actually_consumed
 with open(PROGRESS_FILE, 'w') as f:
-    f.write(str(end_idx))
+    f.write(str(next_start))
 
 ok = sum(1 for r in results if r['status'] == 'OK')
-fail = sum(1 for r in results if r['status'] == 'FAIL')
-print(f"\nDONE: {start_idx}-{end_idx-1} | OK={ok} FAIL={fail}")
-print(f"NEXT: {end_idx}" if end_idx < len(entries) else "ALL_DONE")
+skipped = sum(1 for r in results if r['status'] == 'SKIP')
+failed = sum(1 for r in results if r['status'] in ('FAIL', 'RATE_LIMITED'))
+print(f"\nDONE: start={start_idx} | OK={ok} FAIL={failed} SKIP(已迁移)={skipped} | 下次: {next_start}")
+if next_start >= len(entries):
+    print("ALL_DONE")
+else:
+    print(f"NEXT: {next_start}/{len(entries)}")
