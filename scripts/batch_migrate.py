@@ -95,6 +95,10 @@ DATA_FILE = '/tmp/yuque_entries.json'
 PROGRESS_FILE = '/tmp/yuque_batch_progress.txt'
 PREV_RESULTS_FILE = '/tmp/yuque_prev_results.json'
 
+# 拆分阈值（Notion Markdown API 隐式大小限制）
+MAX_CONTENT_CHARS = 50000
+MIN_CHUNK_BYTES = 5 * 1024  # 章节 < 5KB 不独立成页，合并到上一章
+
 def mcpcall(tool, args, retries=3):
     cmd = ['mcporter', 'call', tool, '--args', json.dumps(args), '--output', 'json']
     # 必须固定 cwd：mcporter 按 cwd 找 MCP server 配置，/tmp 下找不到 yuque-mcp
@@ -129,16 +133,13 @@ def fetch_doc_with_retry(entry, book_id, max_retries=2):
         result = mcpcall('yuque-mcp.yuque_web_get_doc', {
             'id': str(entry['doc_id']), 'book_id': book_id
         })
-        # None = 网络/超时/系统错误
         if result is None:
             if attempt < max_retries:
                 print(f"    [retry] 网络异常, 等 10s 后重试 ({attempt+1}/{max_retries})")
                 time.sleep(10)
             continue
-        # 正常结果：有 body
         if result.get('body'):
             return result, None
-        # body 空 = 风控限流：等更久再重试
         if attempt == 0:
             print(f"    [retry] body 空（疑似风控）, 等 30s 后重试")
             time.sleep(30)
@@ -170,22 +171,19 @@ def doc_body_precheck(result, entry):
         return False, 'R8_空body'
 
     total = len(body)
-    # R1: 二进制 — 可读文本比例 < 5%，且无 lake card 标签
     readable = len(re.findall(r'[\u4e00-\u9fff\w]{2,}', body))
     has_card = '<card' in body
+    # R1: 二进制 — 可读文本比例 < 5%，且无 lake card 标签
     if not has_card and readable < max(5, total * 0.05) and total > 500:
         return False, 'R1_二进制'
-
     # R2: 数据库 dump — 10+ 条 SQL 模式
-    sql_lines = len(re.findall(r'(CREATE\s+TABLE|INSERT\s+INTO|DROP\s+TABLE|ALTER\s+TABLE|' +
+    sql_lines = len(re.findall(r'(CREATE\s+TABLE|INSERT\s+INTO|DROP\s+TABLE|ALTER\s+TABLE|'
                                 r'CREATE\s+INDEX|TRUNCATE\s+TABLE)', body, re.I))
     if sql_lines > 10:
         return False, 'R2_数据库dump'
-
     # R8: 无意义内容 — 可读字符 < 10 且 word_count < 5，且无 card
     if not has_card and readable < 10 and word_count < 5:
         return False, 'R8_无意义内容'
-
     return True, None
 
 
@@ -203,8 +201,55 @@ def check_notion_exists(yuque_url):
         timeout=30
     )
     if r.status_code != 200:
-        return False  # 查失败不拦截，宁可重复不可漏
+        return False
     return len(r.json().get('results', [])) > 0
+
+
+def split_markdown_by_headings(markdown, threshold=MAX_CONTENT_CHARS, min_chunk=MIN_CHUNK_BYTES):
+    """按 ##/### 拆分长 markdown。返回 [(chapter_title, content), ...]"""
+    if len(markdown) <= threshold:
+        return [(None, markdown)]
+
+    # 按 ## 或 ### 标题拆分
+    pattern = re.compile(r'^(#{2,3})\s+(.+)$', re.MULTILINE)
+    matches = list(pattern.finditer(markdown))
+
+    if not matches:
+        # 没有标题可拆分 → 硬截断
+        return [(None, markdown[:threshold] + '\n\n...（内容过长已截断）')]
+
+    chunks = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i+1].start() if i+1 < len(matches) else len(markdown)
+        heading_text = m.group(2).strip()[:80]
+        content = markdown[start:end].strip()
+
+        if len(content) < min_chunk and chunks:
+            prev_title, prev_content = chunks.pop()
+            chunks.append((prev_title, prev_content + '\n\n' + content))
+        else:
+            chunks.append((heading_text, content))
+
+    return chunks
+
+
+def write_markdown_and_images(page_id, markdown_slice, img_list, tag_str):
+    """写 markdown 内容 + 图片上传。返回 True/False"""
+    if not markdown_slice:
+        return True
+    if len(markdown_slice) > MAX_CONTENT_CHARS:
+        markdown_slice = markdown_slice[:MAX_CONTENT_CHARS] + '\n\n...（内容过长已截断）'
+    ok = update_page_markdown(page_id, markdown_slice)
+    if not ok:
+        return False
+    if img_list:
+        upload_map = notion_upload_images(img_list)
+        if upload_map:
+            n = notion_attach_images(page_id, upload_map, markdown_slice)
+            if n:
+                print(f"        [img] 已原生上传 {n} 张")
+    return True
 
 
 def extract_url(body, source):
@@ -233,8 +278,6 @@ def extract_tags(title, body, source, category):
     text = re.sub(r'<[^>]+>', ' ', decoded)
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # Clean title: remove all special chars, split into words
-    # Handle compound terms (e.g. MyBatis-Plus -> MybatisPlus)
     ctitle = title
     for term in ['MyBatis-Plus','Mybatis-Plus','mybatis-plus','Spring-Boot','Spring-Cloud',
                  'Cloud-Alibaba','CloudAlibaba','Element-UI','ElementUI']:
@@ -272,7 +315,6 @@ def extract_tags(title, body, source, category):
     result = []
     for k in keywords:
         k = k.strip()
-        # Skip purely numeric tags
         if re.match(r'^\d+$', k):
             continue
         if k and k not in seen and len(k) >= 2:
@@ -280,13 +322,14 @@ def extract_tags(title, body, source, category):
             result.append(k)
     return result[:15]
 
-# Read progress
+
+# ── 主流程 ──
+
 start_idx = 0
 if os.path.exists(PROGRESS_FILE):
     with open(PROGRESS_FILE) as f:
         start_idx = int(f.read().strip())
 
-# Load already-processed doc_ids for skip-on-exist
 processed_ids = set()
 if os.path.exists(PREV_RESULTS_FILE):
     try:
@@ -315,13 +358,13 @@ for i, entry in enumerate(batch):
     idx = start_idx + i
     doc_id = str(entry['doc_id'])
 
-    # 去重：已成功迁移的跳过
+    # ───── 去重：本地已记录 ─────
     if doc_id in processed_ids:
         print(f"  [{idx}] SKIP（已迁移）- {entry['title'][:50]}")
         results.append({'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50], 'doc_id': doc_id})
         continue
 
-    # 取文档（含渐进退避：网络异常→10s, body空→30s/60s, 最多重试2次）
+    # ───── 取文档 ─────
     result, fail_reason = fetch_doc_with_retry(entry, YUQUE_BOOK_ID)
     if result is None:
         status = fail_reason or 'FAIL'
@@ -333,7 +376,7 @@ for i, entry in enumerate(batch):
 
     body = result.get('body', '')
 
-    # 文档预检：R1 二进制 / R2 数据库dump / R8 无意义内容
+    # ───── 文档预检 ─────
     precheck_pass, precheck_reason = doc_body_precheck(result, entry)
     if not precheck_pass:
         print(f"  [{idx}] SKIP ({precheck_reason}) - {entry['title'][:50]}")
@@ -343,12 +386,16 @@ for i, entry in enumerate(batch):
         save_result(entry_result)
         continue
 
+    # ───── lake → markdown ─────
     markdown, img_list = lake_to_markdown(body)
     url = extract_url(body, entry['source'])
     tags = extract_tags(entry['title'], body, entry['source'], entry['category'])
 
     yuque_url = f'https://www.yuque.com/{YUQUE_USER}/{YUQUE_NAMESPACE}/{result.get("slug", "")}'
+    tag_str = '/'.join(tags[:6])
+    if len(tags) > 6: tag_str += f"...(+{len(tags)-6})"
 
+    # ───── 构建 Notion 属性 ─────
     props = {
         '名称': {'title': [{'text': {'content': entry['title'][:2000]}}]},
         '来源': {'select': {'name': entry['source']}},
@@ -360,7 +407,7 @@ for i, entry in enumerate(batch):
     if url:
         props['备注'] = {'rich_text': [{'text': {'content': f'原文出处: {url}'}}]}
 
-    # 去重：查 Notion 是否已有同原文链接的记录
+    # ───── 去重：Notion 侧 ─────
     if check_notion_exists(yuque_url):
         print(f"  [{idx}] SKIP（Notion 已存在）- {entry['title'][:50]}")
         entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
@@ -369,8 +416,11 @@ for i, entry in enumerate(batch):
         save_result(entry_result)
         continue
 
-    page = create_notion_page(props)
+    # ───── 拆分 Big Doc ─────
+    chunks = split_markdown_by_headings(markdown)
 
+    # 创建主页面
+    page = create_notion_page(props)
     if not page or not page.get('id'):
         print(f"  [{idx}] FAIL: 创建页失败 - {entry['title'][:50]}")
         entry_result = {'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50],
@@ -378,31 +428,60 @@ for i, entry in enumerate(batch):
         results.append(entry_result)
         save_result(entry_result)
         continue
+    main_page_id = page['id']
 
-    if markdown:
-        if len(markdown) > 50000:
-            markdown = markdown[:50000] + "\n\n...（内容过长已截断）"
-        update_page_markdown(page['id'], markdown)
-        if img_list:
-            upload_map = notion_upload_images(img_list)
-            if upload_map:
-                n = notion_attach_images(page['id'], upload_map, markdown)
-                if n: print(f"        [img] 已原生上传 {n} 张")
+    pages_created = 1  # 主页面
+    split_notes = []
 
-    tag_str = '/'.join(tags[:6])
-    if len(tags) > 6: tag_str += f"...(+{len(tags)-6})"
-    print(f"  [{idx}] OK | {entry['category']:8s} | {len(markdown):5d}字 | TAGS: {tag_str}")
-    print(f"        原文链接: https://www.yuque.com/yehuoshun/twpgac/{result.get('slug', '')}")
+    for ci, (chapter_title, chapter_content) in enumerate(chunks):
+        if ci == 0:
+            # 第一章 → 写入主页面
+            write_markdown_and_images(main_page_id, chapter_content, img_list, tag_str)
+        else:
+            # 第 N 章 → 创建独立页面
+            child_title = f"{entry['title'][:60]} - {chapter_title}"
+            child_props = {
+                '名称': {'title': [{'text': {'content': child_title[:2000]}}]},
+                '来源': {'select': {'name': entry['source']}},
+                '分类': {'select': {'name': entry['category']}},
+                '字数': {'number': result.get('word_count', 0)},
+                '标签': {'multi_select': [{'name': t} for t in tags[:15]]},
+                '原文链接': {'url': yuque_url}
+            }
+            # 备注：父文档来源
+            child_note = f"从语雀「{YUQUE_NAMESPACE}」中的「{entry['title']}」拆分而来，此为第{ci+1}章「{chapter_title}」"
+            child_props['备注'] = {'rich_text': [{'text': {'content': child_note[:2000]}}]}
+
+            child_page = create_notion_page(child_props)
+            if child_page and child_page.get('id'):
+                write_markdown_and_images(child_page['id'], chapter_content, img_list, tag_str)
+                pages_created += 1
+                split_notes.append(chapter_title[:50])
+                time.sleep(5)  # 子页面间稍等防止限流
+            else:
+                print(f"    [split] 子页创建失败: {child_title[:40]}")
+                split_notes.append(f"❌{chapter_title[:40]}(创建失败)")
+
+    # ───── 打印结果 ─────
+    is_split = pages_created > 1
+    if is_split:
+        print(f"  [{idx}] OK | {entry['category']:8s} | {len(markdown):5d}字 | {pages_created}页拆分 | TAGS: {tag_str}")
+        for sn in split_notes:
+            print(f"        ↳ {sn}")
+    else:
+        print(f"  [{idx}] OK | {entry['category']:8s} | {len(markdown):5d}字 | TAGS: {tag_str}")
+
+    print(f"        原文链接: {yuque_url}")
     if url:
         print(f"        备注: 原文出处: {url}")
+
     entry_result = {'idx': idx, 'status': 'OK', 'title': entry['title'][:50], 'doc_id': doc_id,
-                    'words': len(markdown), 'tags': len(tags)}
+                    'words': len(markdown), 'tags': len(tags), 'pages': pages_created}
     results.append(entry_result)
     save_result(entry_result)
     time.sleep(20)
 
-# Save progress: 实际消耗了多少篇（skip已迁移的不算消耗）
-# 避免风控跳过导致进度跳空丢文档
+# ───── 保存进度 ─────
 actually_consumed = sum(1 for r in results if r['status'] != 'SKIP')
 next_start = start_idx + actually_consumed
 with open(PROGRESS_FILE, 'w') as f:
