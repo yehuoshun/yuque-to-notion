@@ -42,6 +42,8 @@ class Settings:
     env_file: str
     mcp_cwd: str
     dry_run: bool
+    resume_write: bool
+    only_images: bool
     notion_token: str
     sources: dict  # 字段 -> 生效来源，供 --print-config 用
 
@@ -70,6 +72,10 @@ def build_parser(prog='batch_migrate'):
                    help=f'mcporter 工作目录（默认 {DEFAULT_MCP_CWD}）')
     p.add_argument('--dry-run', dest='dry_run', action='store_true',
                    help='只探活 + 列批次，不写任何东西')
+    p.add_argument('--resume-write', dest='resume_write', action='store_true',
+                   help='补写模式：只往上次结果里已存在的页补正文（PARTIAL 记录），不建页、不推进度')
+    p.add_argument('--only-images', dest='only_images', action='store_true',
+                   help='配合 --resume-write：只补图片，不重写正文（用于 imgs 缺失的记录）')
     p.add_argument('--print-config', dest='print_config', action='store_true',
                    help='打印生效配置（token 打码）后退出')
     return p
@@ -198,6 +204,8 @@ def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
         progress_file=os.path.join(state_dir, 'progress.txt'),
         prev_results_file=os.path.join(state_dir, 'prev_results.json'),
         env_file=env_file, mcp_cwd=mcp_cwd, dry_run=bool(args.dry_run),
+        resume_write=bool(args.resume_write) or bool(args.only_images),
+        only_images=bool(args.only_images),
         notion_token=notion_token, sources=src)
 
     if args.print_config:
@@ -225,6 +233,8 @@ def print_config(s):
         ('env_file', s.env_file, 'env_file'),
         ('mcp_cwd', s.mcp_cwd, 'mcp_cwd'),
         ('dry_run', s.dry_run, 'dry_run'),
+        ('resume_write', s.resume_write, 'resume_write'),
+        ('only_images', s.only_images, 'only_images'),
         ('NOTION_TOKEN', _mask(s.notion_token), 'notion_token'),
     ]
     print('生效配置（命令行 > 环境变量 > config.py）')

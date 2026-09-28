@@ -1,5 +1,5 @@
-import json, re, urllib.parse, subprocess, sys, hashlib, os, requests, base64
-from cli import read_env_file, load_settings, DEFAULT_ENV_FILE, REPO_ROOT
+import json, re, urllib.parse, subprocess, sys, os, requests, base64
+from cli import load_settings
 
 def decode_card_value(raw_val):
     """解码 card 的 value 属性：URL解码 → 去 data: 前缀 → JSON parse"""
@@ -21,79 +21,10 @@ LANG_MAP = {'markdown': 'markdown', 'md': 'markdown', 'css': 'css',
             'kotlin': 'kotlin', 'scala': 'scala', 'dockerfile': 'dockerfile',
             'groovy': 'groovy'}
 
-# ── GitHub 图床配置 ──
-GITHUB_REPO = 'yehuoshun/notion-images'
-GITHUB_BRANCH = 'main'
-GITHUB_PAT = None
-IMG_CACHE_FILE = None
-_img_cache = {}  # md5 -> url
-
-def _load_env():
-    global GITHUB_PAT
-    if GITHUB_PAT:
-        return
-    # 凭据文件路径不再写死：环境变量 > 默认位置
-    path = os.environ.get('OPENCLAW_CREDENTIALS') or DEFAULT_ENV_FILE
-    creds = read_env_file(path)
-    GITHUB_PAT = creds.get('GITHUB_PAT_CLASSIC', '') or os.environ.get('GITHUB_PAT_CLASSIC', '')
-
-def init_image_uploader(cache_file=None):
-    """初始化上传器：加载缓存。返回 None"""
-    global IMG_CACHE_FILE, _img_cache
-    if cache_file is None:
-        cache_file = os.environ.get('YUQUE_IMG_CACHE') or os.path.join(REPO_ROOT, 'yuque-images-cache.json')
-    IMG_CACHE_FILE = cache_file
-    _load_env()
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file) as f:
-                _img_cache.update(json.load(f))
-        except Exception:
-            pass
-
-def upload_base64_image(b64_data, ext='png'):
-    """上传 base64 图片到 GitHub 图床，返回公网 URL。
-    相同内容（md5）自动去重。ext: png/jpg/gif/webp"""
-    global _img_cache
-    if not GITHUB_PAT:
-        _load_env()
-    try:
-        raw = base64.b64decode(b64_data)
-    except Exception:
-        return None
-    if not raw:
-        return None
-    md5 = hashlib.md5(raw).hexdigest()
-    if md5 in _img_cache:
-        return _img_cache[md5]
-    path = f'images/{md5}.{ext}'
-    url = f'https://cdn.jsdelivr.net/gh/{GITHUB_REPO}@{GITHUB_BRANCH}/{path}'
-    # 上传（PUT contents API）
-    headers = {'Authorization': f'token {GITHUB_PAT}', 'Accept': 'application/vnd.github+json'}
-    r = requests.put(
-        f'https://api.github.com/repos/{GITHUB_REPO}/contents/{path}',
-        headers=headers,
-        json={'message': f'add {path}', 'content': b64_data},
-        timeout=60)
-    if r.status_code in (200, 201):
-        _img_cache[md5] = url
-        _save_cache()
-        return url
-    if r.status_code == 422:
-        # 文件已存在：那 URL 就是可用的
-        _img_cache[md5] = url
-        _save_cache()
-        return url
-    print(f'    [img] 上传失败 {r.status_code}: {r.text[:150]}')
-    return None
-
-def _save_cache():
-    if IMG_CACHE_FILE:
-        try:
-            with open(IMG_CACHE_FILE, 'w') as f:
-                json.dump(_img_cache, f, ensure_ascii=False)
-        except Exception:
-            pass
+# ── 说明：公网图床降级已移除（2026-09-28）──
+# 理由：实测 Notion 原生 file_upload 几乎不失败；external 图是客户端拉取，
+# 图床必须公网可读，等于把语雀私有库图片推到公网，单向不可撤回。
+# 图片失败现在走 batch_migrate 的「记账 + 重试 + --resume-write 后补」。
 
 def _ext_from_src(src):
     m = re.search(r'\.(png|jpe?g|gif|webp|svg|bmp)', src, re.I)
@@ -228,7 +159,6 @@ def list_to_markdown(inner, ordered=False):
     return '\n' + '\n'.join(lines) + '\n' if lines else ''
 
 if __name__ == '__main__':
-    init_image_uploader()
     # 用法：python3 lake_convert.py [doc_id] [--book-id xxx] ...
     # 纯数字参数当 doc_id，其余交给 cli（支持 --book-id / --print-config 等）
     cli_argv = [a for a in sys.argv[1:] if not a.isdigit()]

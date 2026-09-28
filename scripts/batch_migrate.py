@@ -79,18 +79,29 @@ def create_notion_page(props):
     return None
 
 def update_page_markdown(page_id, markdown):
-    r = requests.patch(f'https://api.notion.com/v1/pages/{page_id}/markdown',
-        headers=NOTION_HEADERS,
-        json={'type': 'replace_content', 'replace_content': {'new_str': markdown, 'allow_deleting_content': True}},
-        timeout=120)
-    if r.status_code not in (200, 201):
-        print(f"    [notion] markdown 写入失败 {r.status_code}: {r.text[:200]}")
-        return False
-    return True
+    """写 markdown 到页面。返回 HTTP 状态码（int），异常返回 None。"""
+    try:
+        r = requests.patch(f'https://api.notion.com/v1/pages/{page_id}/markdown',
+            headers=NOTION_HEADERS,
+            json={'type': 'replace_content', 'replace_content': {'new_str': markdown, 'allow_deleting_content': True}},
+            timeout=120)
+        if r.status_code not in (200, 201):
+            print(f"    [notion] markdown 写入失败 {r.status_code}: {r.text[:200]}")
+        return r.status_code
+    except Exception as e:
+        print(f"    [notion] markdown 写入异常 {e}")
+        return None
+
+# 图片上传：逐张重试 + 节流（实测连发不会 429，但大图文档不该硬怼）
+IMG_RETRIES = 2        # 429/5xx 重试次数
+IMG_RETRY_WAIT = 1.5    # 重试基础等待（退避乘 2^n）
+IMG_THROTTLE = 0.2      # 每张间隔（秒）
 
 def notion_upload_images(image_srcs):
-    """原生上传 base64 图片到 Notion，返回 {placeholder_url: file_upload_id}"""
+    """原生上传 base64 图片到 Notion。
+    返回 (upload_map, failed_list)：failed 里每项是 '索引:阶段:原因'。"""
     result = {}
+    failed = []
     for i, (src, link, ext) in enumerate(image_srcs):
         if not src or not src.startswith('data:image/'):
             continue
@@ -98,35 +109,73 @@ def notion_upload_images(image_srcs):
         try:
             raw = base64.b64decode(b64)
         except Exception:
+            failed.append(f'{i}:decode:b64')
             continue
         if not raw:
+            failed.append(f'{i}:decode:empty')
             continue
-        r1 = requests.post('https://api.notion.com/v1/file_uploads',
-            headers=NOTION_HEADERS,
-            json={'mode': 'single_part', 'filename': f'img_{i}.{ext}', 'content_type': f'image/{ext}'},
-            timeout=60)
+
+        # 创建上传会话（重试）
+        r1 = None
+        for attempt in range(IMG_RETRIES + 1):
+            try:
+                r1 = requests.post('https://api.notion.com/v1/file_uploads',
+                    headers=NOTION_HEADERS,
+                    json={'mode': 'single_part', 'filename': f'img_{i}.{ext}', 'content_type': f'image/{ext}'},
+                    timeout=60)
+            except Exception as e:
+                r1 = None
+            if r1 is not None and r1.status_code in (200, 201):
+                break
+            if attempt < IMG_RETRIES:
+                time.sleep(IMG_RETRY_WAIT * (2 ** attempt))
+        if r1 is None:
+            failed.append(f'{i}:create:exc')
+            continue
         if r1.status_code not in (200, 201):
-            print(f"    [img] 创建上传失败 {r1.status_code}: {r1.text[:150]}")
+            failed.append(f'{i}:create:{r1.status_code}')
             continue
+
+        # 传字节（重试）
         fu = r1.json()
-        r2 = requests.post(fu['upload_url'],
-            headers={'Authorization': f'Bearer {NOTION_TOKEN}', 'Notion-Version': '2026-03-11'},
-            files={'file': (f'img_{i}.{ext}', raw, f'image/{ext}')}, timeout=120)
-        if r2.status_code not in (200, 201):
-            print(f"    [img] 发送内容失败 {r2.status_code}: {r2.text[:150]}")
+        r2 = None
+        for attempt in range(IMG_RETRIES + 1):
+            try:
+                r2 = requests.post(fu['upload_url'],
+                    headers={'Authorization': f'Bearer {NOTION_TOKEN}', 'Notion-Version': '2026-03-11'},
+                    files={'file': (f'img_{i}.{ext}', raw, f'image/{ext}')}, timeout=120)
+            except Exception:
+                r2 = None
+            if r2 is not None and r2.status_code in (200, 201):
+                break
+            if attempt < IMG_RETRIES:
+                time.sleep(IMG_RETRY_WAIT * (2 ** attempt))
+        if r2 is None:
+            failed.append(f'{i}:upload:exc')
             continue
+        if r2.status_code not in (200, 201):
+            failed.append(f'{i}:upload:{r2.status_code}')
+            continue
+
         placeholder = f'https://n2m.local/img_{i}.{ext}'
         result[placeholder] = fu['id']
-    return result
+        time.sleep(IMG_THROTTLE)
+    return result, failed
 
 def notion_attach_images(page_id, upload_map, markdown):
-    """读回页面 blocks，把占位图 PATCH 成 file_upload 类型"""
-    r = requests.get(f'https://api.notion.com/v1/blocks/{page_id}/children',
-        headers=NOTION_HEADERS, timeout=60)
+    """读回页面 blocks，把占位图 PATCH 成 file_upload 类型。
+    返回 (attached, failed_list)。"""
+    try:
+        r = requests.get(f'https://api.notion.com/v1/blocks/{page_id}/children',
+            headers=NOTION_HEADERS, timeout=60)
+    except Exception as e:
+        print(f"    [img] 读 blocks 异常 {e}")
+        return 0, [f'read:exc']
     if r.status_code != 200:
         print(f"    [img] 读 blocks 失败 {r.status_code}")
-        return 0
+        return 0, [f'read:{r.status_code}']
     attached = 0
+    failed = []
     for b in r.json().get('results', []):
         if b.get('type') != 'image':
             continue
@@ -135,13 +184,18 @@ def notion_attach_images(page_id, upload_map, markdown):
         if url not in upload_map:
             continue
         fuid = upload_map[url]
-        r2 = requests.patch(f"https://api.notion.com/v1/blocks/{b['id']}", headers=NOTION_HEADERS,
-            json={'image': {'file_upload': {'id': fuid}}}, timeout=60)
-        if r2.status_code in (200, 201):
+        try:
+            r2 = requests.patch(f"https://api.notion.com/v1/blocks/{b['id']}", headers=NOTION_HEADERS,
+                json={'image': {'file_upload': {'id': fuid}}}, timeout=60)
+        except Exception:
+            r2 = None
+        if r2 is not None and r2.status_code in (200, 201):
             attached += 1
         else:
-            print(f"    [img] PATCH 失败 {r2.status_code}: {r2.text[:150]}")
-    return attached
+            code = r2.status_code if r2 is not None else 'exc'
+            print(f"    [img] PATCH 失败 {code}: {r2.text[:150] if r2 is not None else ''}")
+            failed.append(f'{url}:patch:{code}')
+    return attached, failed
 
 URL_PATTERN = r'https?://[^\s"<>\')\]]+'
 
@@ -285,22 +339,92 @@ def split_markdown_by_headings(markdown, threshold=MAX_CONTENT_CHARS, min_chunk=
     return chunks
 
 
-def write_markdown_and_images(page_id, markdown_slice, img_list, tag_str):
-    """写 markdown 内容 + 图片上传。返回 True/False"""
-    if not markdown_slice:
-        return True
-    if len(markdown_slice) > MAX_CONTENT_CHARS:
-        markdown_slice = markdown_slice[:MAX_CONTENT_CHARS] + '\n\n...（内容过长已截断）'
-    ok = update_page_markdown(page_id, markdown_slice)
-    if not ok:
-        return False
-    if img_list:
-        upload_map = notion_upload_images(img_list)
-        if upload_map:
-            n = notion_attach_images(page_id, upload_map, markdown_slice)
-            if n:
-                print(f"        [img] 已原生上传 {n} 张")
-    return True
+def write_markdown_and_images(page_id, markdown_slice, img_list, tag_str, skip_markdown=False):
+    """写 markdown + 图片。
+    返回 (ok: bool, detail: str, imgs_ok: int, imgs_total: int)
+    ok=False 只代表 markdown 写入失败（图片缺失不算整片失败，记 detail）。"""
+    base64_total = sum(1 for src, _, _ in img_list if src and src.startswith('data:image/'))
+    if not skip_markdown:
+        if not markdown_slice:
+            return True, 'ok(空)', 0, base64_total
+        if len(markdown_slice) > MAX_CONTENT_CHARS:
+            markdown_slice = markdown_slice[:MAX_CONTENT_CHARS] + '\n\n...（内容过长已截断）'
+        status = update_page_markdown(page_id, markdown_slice)
+        if status not in (200, 201):
+            return False, f'markdown_failed:{status}', 0, base64_total
+    if base64_total == 0:
+        return True, 'ok', 0, 0
+    upload_map, up_fail = notion_upload_images(img_list)
+    attached, at_fail = notion_attach_images(page_id, upload_map, markdown_slice)
+    detail = f'imgs={attached}/{base64_total}'
+    n_fail = len(up_fail) + len(at_fail)
+    if n_fail:
+        detail += f' fail={n_fail}'
+    return True, detail, attached, base64_total
+
+
+def repair_pages(records, entries):
+    """--resume-write / --only-images：往已存在的页补写正文/图片。
+    不建页、不去重、不推进度。records 来自 prev_results.json。"""
+    by_id = {str(r.get('doc_id')): r for r in records}
+    missing = [e for e in entries if str(e.get('doc_id')) not in by_id]
+    batch = [e for e in entries if str(e.get('doc_id')) in by_id]
+    if missing:
+        print(f'[repair] 条目文件里有 {len(missing)} 篇在结果里没有对应记录（可能换过书），跳过')
+    if not batch:
+        print('ALL_DONE (nothing to repair)')
+        return 0
+    print(f'REPAIR: {len(batch)} 篇 | only_images={S.only_images}')
+    ok = partial = failed = 0
+    for e in batch:
+        doc_id = str(e['doc_id'])
+        rec = by_id[doc_id]
+        print(f"  [{rec.get('idx','?')}] 补写 {str(e.get('title',''))[:50]}")
+        result, fr = fetch_doc_with_retry(e, YUQUE_BOOK_ID)
+        if result is None:
+            print(f"    FAIL 抓取失败 {fr}")
+            failed += 1
+            continue
+        markdown, img_list = lake_to_markdown(result.get('body', ''))
+        chunks = split_markdown_by_headings(markdown)
+        page_ids = rec.get('page_ids') or {}
+        chunks_ok = 0
+        imgs_ok_sum = 0
+        imgs_total = 0
+        notes = []
+        for ci, (ct, c) in enumerate(chunks):
+            pid = page_ids.get(str(ci)) or page_ids.get(ci)
+            if not pid:
+                notes.append(f'chunk{ci}:无page_id')
+                continue
+            okw, detail, io, it = write_markdown_and_images(
+                pid, c, img_list, tag_str='', skip_markdown=S.only_images)
+            imgs_ok_sum += io
+            imgs_total = max(imgs_total, it)
+            if okw:
+                chunks_ok += 1
+            else:
+                notes.append(f'chunk{ci}:{detail}')
+        good = chunks_ok == len(chunks) and not notes
+        if S.only_images:
+            good = imgs_ok_sum >= imgs_total or not notes
+        status = 'OK' if good else 'PARTIAL'
+        if status == 'OK':
+            ok += 1
+        else:
+            partial += 1
+        entry_result = {'idx': rec.get('idx'), 'status': status, 'title': e.get('title'),
+                        'doc_id': doc_id, 'words': len(markdown),
+                        'pages': len(page_ids) or 1,
+                        'page_ids': page_ids,
+                        'chunks_ok': chunks_ok, 'chunks_total': len(chunks),
+                        'imgs_ok': imgs_ok_sum, 'imgs_total': imgs_total,
+                        'detail': '; '.join(notes) if notes else ''}
+        save_result(entry_result)
+        print(f"    {status} | chunks={chunks_ok}/{len(chunks)} imgs={imgs_ok_sum}/{imgs_total} {'| '+'; '.join(notes) if notes else ''}")
+        time.sleep(5)
+    print(f'\nDONE: resume-write | OK={ok} PARTIAL={partial} FAIL={failed}')
+    return 0
 
 
 def extract_url(body, source):
@@ -432,6 +556,25 @@ if not os.path.exists(DATA_FILE):
 with open(DATA_FILE) as f:
     entries = json.load(f)
 
+# ── 补写模式：只往已存在的页补，不建页/不去重/不推进度 ──
+if S.resume_write:
+    if not os.path.exists(PREV_RESULTS_FILE):
+        print(f'[FATAL] 没有结果文件可补：{PREV_RESULTS_FILE}')
+        sys.exit(2)
+    with open(PREV_RESULTS_FILE) as f:
+        all_recs = json.load(f)
+    if S.only_images:
+        records = [r for r in all_recs if r.get('imgs_total', 0) > r.get('imgs_ok', 0)]
+    else:
+        records = [r for r in all_recs if r.get('status') == 'PARTIAL']
+    if S.dry_run:
+        print(f'[dry-run] 补写模式：待处理 {len(records)} 篇（only_images={S.only_images}）')
+        for r in records:
+            print(f"   [{r.get('idx','?')}] {r.get('title','')[:60]} imgs={r.get('imgs_ok')}/{r.get('imgs_total')}")
+        print('[dry-run] 结束，未写入任何内容')
+        sys.exit(0)
+    sys.exit(repair_pages(records, entries))
+
 # 构建批次：resume/new 按索引连续取；retry-failed 只取失败的那些
 if MODE == 'retry-failed':
     batch = [e for e in entries if str(e['doc_id']) in failed_ids]
@@ -553,13 +696,18 @@ for i, entry in enumerate(batch):
         continue
     main_page_id = page['id']
 
-    pages_created = 1  # 主页面
+    page_ids = {'0': main_page_id}  # chunk 下标 -> page_id
+    pages_created = 1
+    chunks_ok = 0
+    chunks_total = len(chunks)
+    imgs_ok_total = 0
+    imgs_total_total = 0
+    problems = []
     split_notes = []
 
     for ci, (chapter_title, chapter_content) in enumerate(chunks):
         if ci == 0:
-            # 第一章 → 写入主页面
-            write_markdown_and_images(main_page_id, chapter_content, img_list, tag_str)
+            target_page = main_page_id
         else:
             # 第 N 章 → 创建独立页面
             child_title = f"{entry['title'][:60]} - {chapter_title}"
@@ -576,48 +724,68 @@ for i, entry in enumerate(batch):
             child_props['备注'] = {'rich_text': [{'text': {'content': child_note[:2000]}}]}
 
             child_page = create_notion_page(child_props)
-            if child_page and child_page.get('id'):
-                write_markdown_and_images(child_page['id'], chapter_content, img_list, tag_str)
-                pages_created += 1
-                split_notes.append(chapter_title[:50])
-                time.sleep(5)  # 子页面间稍等防止限流
-            else:
-                print(f"    [split] 子页创建失败: {child_title[:40]}")
+            if not child_page or not child_page.get('id'):
+                problems.append(f'chunk{ci}:子页创建失败:{chapter_title[:20]}')
                 split_notes.append(f"❌{chapter_title[:40]}(创建失败)")
+                continue
+            target_page = child_page['id']
+            page_ids[str(ci)] = target_page
+            pages_created += 1
+            split_notes.append(chapter_title[:50])
+            time.sleep(5)  # 子页面间稍等防止限流
+
+        okw, detail, io, it = write_markdown_and_images(target_page, chapter_content, img_list, tag_str)
+        imgs_ok_total += io
+        imgs_total_total = max(imgs_total_total, it)
+        if okw:
+            chunks_ok += 1
+        else:
+            problems.append(f'chunk{ci}:{detail}')
+            split_notes.append(f"❌{chapter_title[:40]}(正文写失败)")
+
+    # ───── 状态判定 ─────
+    status = 'OK' if (chunks_ok == chunks_total and not problems) else 'PARTIAL'
+    detail = '; '.join(problems) if problems else ''
 
     # ───── 打印结果 ─────
-    is_split = pages_created > 1
-    if is_split:
-        print(f"  [{idx}] OK | {entry['category']:8s} | {len(markdown):5d}字 | {pages_created}页拆分 | TAGS: {tag_str}")
+    print(f"  [{idx}] {status} | {entry['category']:8s} | {len(markdown):5d}字 | chunks={chunks_ok}/{chunks_total} | imgs={imgs_ok_total}/{imgs_total_total} | TAGS: {tag_str}")
+    if is_split := pages_created > 1:
         for sn in split_notes:
             print(f"        ↳ {sn}")
-    else:
-        print(f"  [{idx}] OK | {entry['category']:8s} | {len(markdown):5d}字 | TAGS: {tag_str}")
+    if detail:
+        print(f"        ⚠ {detail}")
 
     print(f"        原文链接: {yuque_url}")
     if url:
         print(f"        备注: 原文出处: {url}")
 
-    entry_result = {'idx': idx, 'status': 'OK', 'title': entry['title'][:50], 'doc_id': doc_id,
-                    'words': len(markdown), 'tags': len(tags), 'pages': pages_created}
+    entry_result = {'idx': idx, 'status': status, 'title': entry['title'][:50], 'doc_id': doc_id,
+                    'words': len(markdown), 'tags': len(tags), 'pages': pages_created,
+                    'page_ids': page_ids,
+                    'chunks_ok': chunks_ok, 'chunks_total': chunks_total,
+                    'imgs_ok': imgs_ok_total, 'imgs_total': imgs_total_total,
+                    'detail': detail}
     results.append(entry_result)
     save_result(entry_result)
     time.sleep(20)
 
 # ───── 保存进度 ─────
 ok = sum(1 for r in results if r['status'] == 'OK')
+partial = sum(1 for r in results if r['status'] == 'PARTIAL')
 skipped = sum(1 for r in results if r['status'] == 'SKIP')
 failed = sum(1 for r in results if r['status'] in ('FAIL', 'RATE_LIMITED'))
 
 if MODE == 'retry-failed':
     # retry-failed 不推进索引进度（不影响 normal 的批次位置）
-    print(f"\nDONE: retry-failed | OK={ok} FAIL={failed} SKIP={skipped}")
+    print(f"\nDONE: retry-failed | OK={ok} PARTIAL={partial} FAIL={failed} SKIP={skipped}")
 else:
     actually_consumed = sum(1 for r in results if r['status'] != 'SKIP')
     next_start = start_idx + actually_consumed
     with open(PROGRESS_FILE, 'w') as f:
         f.write(str(next_start))
-    print(f"\nDONE: start={start_idx} | OK={ok} FAIL={failed} SKIP(已迁移)={skipped} | 下次: {next_start}")
+    print(f"\nDONE: start={start_idx} | OK={ok} PARTIAL={partial} FAIL={failed} SKIP(已迁移)={skipped} | 下次: {next_start}")
+    if partial:
+        print(f"HINT: {partial} 篇不完整，可跑 --resume-write 补写（--only-images 只补图）")
     if next_start >= len(entries):
         print("ALL_DONE")
     else:
