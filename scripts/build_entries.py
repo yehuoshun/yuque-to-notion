@@ -1,10 +1,13 @@
-import json, re, subprocess
+import json, os, re, subprocess
+from cli import load_settings
+
+S = load_settings(prog='build_entries', require=('book',))
 
 # 从 web toc 重建条目（过滤无标题文档）
 def get_toc():
     cmd = ['mcporter', 'call', 'yuque-mcp.yuque_web_get_toc',
-           '--args', json.dumps({'book_id': '78624582'}), '--output', 'json']
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd='/home/admin/.openclaw/workspace')
+           '--args', json.dumps({'book_id': S.book_id}), '--output', 'json']
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=S.mcp_cwd)
     d = json.loads(r.stdout)
     data = d.get('data', [])
     docs = [x for x in data if x.get('type') == 'DOC' and x.get('title') != '无标题文档']
@@ -76,8 +79,10 @@ def main():
             'source': source,
             'category': cat
         })
-    with open('/tmp/yuque_entries.json', 'w') as f:
+    os.makedirs(S.state_dir, exist_ok=True)
+    with open(S.entries_file, 'w') as f:
         json.dump(entries, f, ensure_ascii=False, indent=1)
+    print('已写入', S.entries_file)
     # 统计
     from collections import Counter
     print('来源分布:', dict(Counter(e['source'] for e in entries)))

@@ -29,14 +29,36 @@ description: 将语雀知识库中的文档批量迁移到 Notion 数据库，�
 ## 使用方式
 
 ```bash
-# 配置 config.py 中的数据库 ID 和知识库 ID
-# 运行迁移
+# 配置走 命令行 > 环境变量 > config.py，改库/改知识库不用改代码
+python3 scripts/batch_migrate.py --help
+
+# 看当前实际生效配置（哪个库、来自哪一层）
+python3 scripts/batch_migrate.py --print-config
+
+# 先探活 + 列批次，不写任何东西
+python3 scripts/batch_migrate.py --dry-run
+
+# 正式跑
 python3 scripts/batch_migrate.py
 ```
 
+状态文件默认落在 `<repo>/state/`（`yuque_entries.json` / `progress.txt` / `prev_results.json`），重启不丢。
+
+## 配置说明
+
+优先级：**命令行 > 环境变量 > config.py 默认值**。
+
+config.py 只放默认值：
+- `NOTION_DATABASE_ID` / `NOTION_DATA_SOURCE_ID`
+- `YUQUE_BOOK_ID` / `YUQUE_NAMESPACE` / `YUQUE_USER`
+- `NOTION_DEDUP_PROPERTY`（判重字段）
+- `BATCH_SIZE` / `MAX_CONTENT_CHARS`
+- `STATE_DIR` / `ENV_FILE` / `MCP_CWD`（留空用内置默认）
+
 ## 迁移流程
 
-1. 获取语雀文档列表
+1. `build_entries.py` 拉知识库目录 → 生成条目文件
+2. 获取语雀文档列表
 2. 分类与标签提取
 3. 创建 Notion 页面（元数据 + 正文内容）
 4. 原文链接提取（从正文中识别原始出处）

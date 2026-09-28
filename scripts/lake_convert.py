@@ -1,4 +1,5 @@
 import json, re, urllib.parse, subprocess, sys, hashlib, os, requests, base64
+from cli import read_env_file, load_settings, DEFAULT_ENV_FILE, REPO_ROOT
 
 def decode_card_value(raw_val):
     """解码 card 的 value 属性：URL解码 → 去 data: 前缀 → JSON parse"""
@@ -31,17 +32,16 @@ def _load_env():
     global GITHUB_PAT
     if GITHUB_PAT:
         return
-    try:
-        with open('/home/admin/.openclaw/secrets/credentials.env') as f:
-            env = f.read()
-        m = re.search(r'GITHUB_PAT_CLASSIC[=:]\s*[\"\x27]?([^\"\x27\n]+)', env)
-        GITHUB_PAT = m.group(1).strip().strip('"').strip("'") if m else ''
-    except Exception:
-        GITHUB_PAT = ''
+    # 凭据文件路径不再写死：环境变量 > 默认位置
+    path = os.environ.get('OPENCLAW_CREDENTIALS') or DEFAULT_ENV_FILE
+    creds = read_env_file(path)
+    GITHUB_PAT = creds.get('GITHUB_PAT_CLASSIC', '') or os.environ.get('GITHUB_PAT_CLASSIC', '')
 
-def init_image_uploader(cache_file='/home/admin/.openclaw/workspace/yuque-images-cache.json'):
+def init_image_uploader(cache_file=None):
     """初始化上传器：加载缓存。返回 None"""
     global IMG_CACHE_FILE, _img_cache
+    if cache_file is None:
+        cache_file = os.environ.get('YUQUE_IMG_CACHE') or os.path.join(REPO_ROOT, 'yuque-images-cache.json')
     IMG_CACHE_FILE = cache_file
     _load_env()
     if os.path.exists(cache_file):
@@ -229,11 +229,15 @@ def list_to_markdown(inner, ordered=False):
 
 if __name__ == '__main__':
     init_image_uploader()
-    doc_id = sys.argv[1] if len(sys.argv) > 1 else '269354748'
+    # 用法：python3 lake_convert.py [doc_id] [--book-id xxx] ...
+    # 纯数字参数当 doc_id，其余交给 cli（支持 --book-id / --print-config 等）
+    cli_argv = [a for a in sys.argv[1:] if not a.isdigit()]
+    S = load_settings(cli_argv, prog='lake_convert', require=('book',))
+    doc_id = next((a for a in sys.argv[1:] if a.isdigit()), '269354748')  # 默认取示例文档
     cmd = ['mcporter', 'call', 'yuque-mcp.yuque_web_get_doc',
-           '--args', json.dumps({'id': doc_id, 'book_id': '78624582'}),
+           '--args', json.dumps({'id': doc_id, 'book_id': S.book_id}),
            '--output', 'json']
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd='/home/admin/.openclaw/workspace')
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=S.mcp_cwd)
     doc = json.loads(r.stdout)
     body = doc.get('body', '')
     print(f"=== {doc.get('title')} ===")

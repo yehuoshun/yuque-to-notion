@@ -1,13 +1,33 @@
-import subprocess, json, urllib.parse, re, time, sys, os
+import base64, subprocess, json, urllib.parse, re, time, sys, os
 import requests
-from config import *
 from lake_convert import lake_to_markdown
+from cli import load_settings, ConfigError, ensure_state_dir
 
-# Notion 直接 REST 调用（绕开 mcporter 命令行 ARG_MAX 限制）
-with open('/home/admin/.openclaw/secrets/credentials.env') as _f:
-    _env = _f.read()
-_m = re.search(r'NOTION_TOKEN[=:]\s*[\"\x27]?([^\"\x27\n]+)', _env)
-NOTION_TOKEN = _m.group(1).strip().strip('"').strip("'") if _m else ''
+# ── 生效配置（命令行 > 环境变量 > config.py），全部从 cli 拿 ──
+S = load_settings(prog='batch_migrate')
+MODE = S.mode
+NOTION_DATABASE_ID = S.notion_db_id
+NOTION_DATA_SOURCE_ID = S.notion_ds_id
+NOTION_DEDUP_PROPERTY = S.dedup_property
+NOTION_TOKEN = S.notion_token
+DEDUP_QUERY_RETRIES = S.dedup_query_retries
+DEDUP_MAX_CONSECUTIVE_FAILURES = S.dedup_max_consecutive_failures
+DATA_FILE = S.entries_file
+PROGRESS_FILE = S.progress_file
+PREV_RESULTS_FILE = S.prev_results_file
+MAX_CONTENT_CHARS = S.max_content_chars
+BATCH_SIZE = S.batch_size
+YUQUE_BOOK_ID = S.book_id
+YUQUE_NAMESPACE = S.namespace
+YUQUE_USER = S.user
+MCP_CWD = S.mcp_cwd
+
+try:
+    ensure_state_dir(S)
+except ConfigError as e:
+    print(f'[FATAL] {e}')
+    sys.exit(2)
+
 NOTION_HEADERS = {
     'Authorization': f'Bearer {NOTION_TOKEN}',
     'Notion-Version': '2026-03-11',
@@ -68,8 +88,6 @@ def update_page_markdown(page_id, markdown):
         return False
     return True
 
-import base64
-
 def notion_upload_images(image_srcs):
     """原生上传 base64 图片到 Notion，返回 {placeholder_url: file_upload_id}"""
     result = {}
@@ -126,18 +144,14 @@ def notion_attach_images(page_id, upload_map, markdown):
     return attached
 
 URL_PATTERN = r'https?://[^\s"<>\')\]]+'
-DATA_FILE = '/tmp/yuque_entries.json'
-PROGRESS_FILE = '/tmp/yuque_batch_progress.txt'
-PREV_RESULTS_FILE = '/tmp/yuque_prev_results.json'
 
 # 拆分阈值（Notion Markdown API 隐式大小限制）
-MAX_CONTENT_CHARS = 50000
+# MAX_CONTENT_CHARS 来自 cli（config.py 是唯一来源，别在别处再定义一次）
 MIN_CHUNK_BYTES = 5 * 1024  # 章节 < 5KB 不独立成页，合并到上一章
 
 def mcpcall(tool, args, retries=3):
     cmd = ['mcporter', 'call', tool, '--args', json.dumps(args), '--output', 'json']
-    # 必须固定 cwd：mcporter 按 cwd 找 MCP server 配置，/tmp 下找不到 yuque-mcp
-    MCP_CWD = '/home/admin/.openclaw/workspace'
+    # 必须固定 cwd：mcporter 靠 cwd 找 MCP server 配置（可用 --mcp-cwd / OPENCLAW_WORKSPACE 覆盖）
     for attempt in range(retries):
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=45, cwd=MCP_CWD)
@@ -362,13 +376,8 @@ def extract_tags(title, body, source, category):
 
 # ── 主流程 ──
 
-# ── 模式解析：new / resume（默认） / retry-failed ──
-MODE = 'resume'
-for arg in sys.argv[1:]:
-    if arg == '--mode':
-        continue
-    if arg in ('new', 'resume', 'retry-failed'):
-        MODE = arg
+# ── 主流程 ──
+# MODE 已由 cli 在开头解析（支持 --mode，也兼容旧的裸 `new|resume|retry-failed`）
 
 if MODE == 'new':
     for f in [PROGRESS_FILE, PREV_RESULTS_FILE]:
@@ -416,6 +425,10 @@ else:
         except Exception:
             pass
 
+if not os.path.exists(DATA_FILE):
+    print(f'[FATAL] 条目文件不存在: {DATA_FILE}')
+    print('[FATAL] 先跑 build_entries.py 生成（可用 --book-id 指定知识库）。')
+    sys.exit(2)
 with open(DATA_FILE) as f:
     entries = json.load(f)
 
@@ -437,6 +450,14 @@ else:
     print(f"BATCH: {start_idx}-{end_idx-1}/{len(entries)}")
 
 print()
+
+if S.dry_run:
+    print('[dry-run] 仅探活 + 列批次，不写任何东西')
+    print(f'[dry-run] 模式={MODE} 本次待处理 {len(batch)} 篇')
+    for j, e in enumerate(batch):
+        print(f'   [{start_idx + j}] {e["doc_id"]}  {str(e.get("title", ""))[:60]}')
+    print('[dry-run] 结束，未写入任何内容')
+    sys.exit(0)
 
 results = []
 dedup_fail_streak = 0  # 去重查询连续失败计数（fail-fast）

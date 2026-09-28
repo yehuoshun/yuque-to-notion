@@ -1,10 +1,15 @@
+# ─────────────────────────────────────────────────────────────
+# 默认值。真正生效的值 = 命令行 > 环境变量 > 这里。
+# 想看当前生效的是什么、来自哪一层：python3 scripts/batch_migrate.py --print-config
+# ─────────────────────────────────────────────────────────────
+
 # Notion 数据库配置
 NOTION_DATABASE_ID = "3c1d7ec2-3709-80f7-8040-ffbfe5e0c2f2"
 NOTION_DATA_SOURCE_ID = ""   # 留空=从库自动解析；填了=校验后强制使用
 
 # 语雀配置
-YUQUE_BOOK_ID = "78624582"  # 废弃16
-YUQUE_NAMESPACE = "twpgac"    # 知识库 slug
+YUQUE_BOOK_ID = "78624582"   # 废弃16
+YUQUE_NAMESPACE = "twpgac"   # 知识库 slug（拼原文链接用）
 YUQUE_USER = "yehuoshun"
 
 # 去重配置（Notion 侧判重）
@@ -14,5 +19,10 @@ DEDUP_MAX_CONSECUTIVE_FAILURES = 2   # 去重查询连续失败这么多篇就�
 
 # 迁移配置
 BATCH_SIZE = 10
-MAX_CONTENT_CHARS = 50000     # 正文最大长度
+MAX_CONTENT_CHARS = 50000     # 正文最大长度（唯一来源，不要在别处再写一遍）
 SLEEP_INTERVAL = 0.3          # API 调用间隔（秒）
+
+# 路径（留空 = 用内置默认，见 cli.py）
+STATE_DIR = ""    # 默认 <repo>/state
+ENV_FILE = ""     # 默认 ~/.openclaw/secrets/credentials.env
+MCP_CWD = ""      # 默认 ~/.openclaw/workspace（mcporter 靠 cwd 找 MCP 配置）

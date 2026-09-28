@@ -1,7 +1,5 @@
 *.pyc
 __pycache__/
-/tmp/
-batch_progress.txt
-yuque_entries.json
+state/
 .env
 credentials.env

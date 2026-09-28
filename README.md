@@ -27,33 +27,68 @@
 
 ### 前置条件
 
-1. 语雀 API Token 已配置
-2. Notion Integration Token 已配置
-3. 目标 Notion 数据库已创建并配有上述字段
+1. Notion Integration Token 已配置（环境变量 `NOTION_TOKEN`，或 `~/.openclaw/secrets/credentials.env`）
+2. 语雀 MCP（`yuque-mcp`）已配置——本工具走语雀 Web API，需要 cookie + ctoken
+3. 目标 Notion 数据库已创建好字段，且已把该库共享给上面那个 Integration
 
 ### 运行
 
 ```bash
-# 第一步：获取语雀知识库文档列表
-python3 scripts/fetch_docs.py <book_id>
+# 第一步：拉知识库目录 → 生成条目文件（写到 <state-dir>/yuque_entries.json）
+python3 scripts/build_entries.py --book-id 78624582
 
-# 第二步：分批迁移到 Notion
+# 第二步：分批迁移到 Notion（每批 10 条）
 python3 scripts/batch_migrate.py
 ```
 
-### 批量迁移
-
-每批处理 10 条，完成后等待确认。进度保存在 `batch_progress.txt`。
+### 配置：命令行 > 环境变量 > config.py
 
 ```bash
-# 重置进度重新开始
-rm -f batch_progress.txt
-python3 scripts/batch_migrate.py
+export NOTION_DATABASE_ID=...     # 或 --db-id
+
+python3 scripts/batch_migrate.py --help          # 全部参数
+python3 scripts/batch_migrate.py --print-config  # 看当前实际生效值 + 来自哪一层
 ```
+
+| 参数 | 环境变量 | 说明 |
+|---|---|---|
+| `--db-id` / `--ds-id` | `NOTION_DATABASE_ID` / `NOTION_DATA_SOURCE_ID` | Notion 库 / data source |
+| `--book-id` / `--namespace` / `--user` | `YUQUE_BOOK_ID` / `YUQUE_NAMESPACE` / `YUQUE_USER` | 语雀知识库 |
+| `--state-dir` | `YUQUE2NOTION_STATE_DIR` | 状态目录，默认 `<repo>/state/` |
+| `--env-file` | `OPENCLAW_CREDENTIALS` | 凭据文件，默认 `~/.openclaw/secrets/credentials.env` |
+| `--dry-run` | — | 只探活 + 列批次，不写任何东西 |
+
+常用例子：
+
+```bash
+# 换一张库、换一个知识库，不改代码
+python3 scripts/batch_migrate.py --db-id <库ID> --book-id <知识库ID> --state-dir ./state
+
+# 先看这批要处理哪几篇，确认再跑
+python3 scripts/batch_migrate.py --dry-run
+```
+
+### 迁移模式
+
+| 模式 | 说明 |
+|---|---|
+| `resume`（默认） | 从进度文件继续；已完成/已在 Notion 的自动跳过 |
+| `new` | 清掉进度和结果，从头开始 |
+| `retry-failed` | 只重跑上轮失败的 |
+
+```bash
+python3 scripts/batch_migrate.py --mode retry-failed
+```
+
+### 状态文件
+
+默认落在 `<repo>/state/`（可用 `--state-dir` 改）：`progress.txt`、`prev_results.json`、`yuque_entries.json`。
+每篇处理完立刻落盘，进程中断不丢结果；重启机器也不丢。
 
 ## 注意事项
 
-- 正文超过 50000 字符会被截断
+- 单个 chunk 超过 `MAX_CONTENT_CHARS`（默认 50000）会被截断
 - 纯数字、单字符标签被过滤
 - 专有名词（如 MyBatis-Plus）自动合并为 MyBatisPlus
 - 标签上限 15 个
+- 配置或目标库有问题时**直接报错退出**（`exit 2`），不会静默跑错库
