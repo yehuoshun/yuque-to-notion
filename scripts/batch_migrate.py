@@ -14,6 +14,41 @@ NOTION_HEADERS = {
     'Content-Type': 'application/json'
 }
 
+# ── Notion 目标库探活：data source 解析 + 判重字段校验 ──
+class NotionInitError(RuntimeError):
+    pass
+
+_DS_ID = None
+
+def resolve_data_source_id():
+    """解析并校验目标 data source。任何一步不对就抛 NotionInitError，不静默降级。
+    原因：2025-09 之后 Notion 把 database 下的数据源拆成 data source，
+    查询必须打 /v1/data_sources/{id}，老的 /v1/databases/{id}/query 已 400。"""
+    global _DS_ID
+    if _DS_ID:
+        return _DS_ID
+    r = requests.get(f'https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}',
+                     headers=NOTION_HEADERS, timeout=30)
+    if r.status_code != 200:
+        raise NotionInitError(f'目标库不可访问 {r.status_code}: {r.text[:200]}')
+    ds_list = r.json().get('data_sources') or []
+    if NOTION_DATA_SOURCE_ID:
+        _DS_ID = NOTION_DATA_SOURCE_ID          # 显式指定优先
+    elif len(ds_list) == 1:
+        _DS_ID = ds_list[0]['id']               # 单源自动取
+    else:
+        raise NotionInitError(
+            f'库下有 {len(ds_list)} 个 data source，请在 config 显式指定 NOTION_DATA_SOURCE_ID')
+    r2 = requests.get(f'https://api.notion.com/v1/data_sources/{_DS_ID}',
+                      headers=NOTION_HEADERS, timeout=30)
+    if r2.status_code != 200:
+        raise NotionInitError(f'data source 不可访问 {r2.status_code}: {r2.text[:200]}')
+    props = r2.json().get('properties') or {}
+    if props.get(NOTION_DEDUP_PROPERTY, {}).get('type') != 'url':
+        raise NotionInitError(f'data source 缺少 url 类型属性「{NOTION_DEDUP_PROPERTY}」')
+    print(f'[notion] 目标 data source: {_DS_ID} | 判重字段: {NOTION_DEDUP_PROPERTY}')
+    return _DS_ID
+
 def create_notion_page(props):
     r = requests.post('https://api.notion.com/v1/pages',
         headers=NOTION_HEADERS,
@@ -188,21 +223,23 @@ def doc_body_precheck(result, entry):
 
 
 def check_notion_exists(yuque_url):
-    """查 Notion 数据库是否有 原文链接=yuque_url 的记录"""
-    r = requests.post(
-        f'https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query',
-        headers=NOTION_HEADERS,
-        json={
-            'filter': {
-                'property': '原文链接',
-                'url': {'equals': yuque_url}
-            }
-        },
-        timeout=30
-    )
-    if r.status_code != 200:
-        return False
-    return len(r.json().get('results', [])) > 0
+    """查 Notion 是否有 判重字段=yuque_url 的记录。
+    True=已存在。查询失败一律抛 NotionInitError —— 绝不静默当成“不存在”。"""
+    ds_id = resolve_data_source_id()
+    body = {'filter': {'property': NOTION_DEDUP_PROPERTY, 'url': {'equals': yuque_url}},
+            'page_size': 1}
+    for attempt in range(DEDUP_QUERY_RETRIES):
+        r = requests.post(f'https://api.notion.com/v1/data_sources/{ds_id}/query',
+                          headers=NOTION_HEADERS, json=body, timeout=30)
+        if r.status_code == 200:
+            return len(r.json().get('results', [])) > 0
+        if r.status_code == 429 or r.status_code >= 500:
+            wait = 3 * (2 ** attempt)
+            print(f'    [notion] 去重查询 {r.status_code}，{wait}s 后重试 ({attempt+1}/{DEDUP_QUERY_RETRIES})')
+            time.sleep(wait)
+            continue
+        raise NotionInitError(f'去重查询失败 {r.status_code}: {r.text[:200]}')
+    raise NotionInitError(f'去重查询连续失败 {DEDUP_QUERY_RETRIES} 次（限流/5xx）')
 
 
 def split_markdown_by_headings(markdown, threshold=MAX_CONTENT_CHARS, min_chunk=MIN_CHUNK_BYTES):
@@ -340,6 +377,14 @@ if MODE == 'new':
             print(f"[mode=new] 已清除 {f}")
     print('[mode=new] 从头开始')
 
+# ── 启动期探活：目标库 / 判重字段不对就别跑（fail-fast，不写入、不推进进度）──
+try:
+    resolve_data_source_id()
+except NotionInitError as e:
+    print(f'[FATAL] Notion 探活失败: {e}')
+    print('[FATAL] 未做任何写入，未推进进度。修好 config 再跑。')
+    sys.exit(2)
+
 start_idx = 0
 processed_ids = set()
 failed_ids = []  # 仅 retry-failed 使用
@@ -394,6 +439,7 @@ else:
 print()
 
 results = []
+dedup_fail_streak = 0  # 去重查询连续失败计数（fail-fast）
 for i, entry in enumerate(batch):
     idx = start_idx + i
     doc_id = str(entry['doc_id'])
@@ -447,8 +493,24 @@ for i, entry in enumerate(batch):
     if url:
         props['备注'] = {'rich_text': [{'text': {'content': f'原文出处: {url}'}}]}
 
-    # ───── 去重：Notion 侧 ─────
-    if check_notion_exists(yuque_url):
+    # ───── 去重：Notion 侧（fail-fast，查询失败不当“不存在”）─────
+    try:
+        notion_exists = check_notion_exists(yuque_url)
+    except NotionInitError as e:
+        dedup_fail_streak += 1
+        print(f"  [{idx}] FAIL: 去重查询异常 - {e}")
+        entry_result = {'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50],
+                        'doc_id': doc_id, 'reason': 'dedup_query_failed'}
+        results.append(entry_result)
+        save_result(entry_result)
+        if dedup_fail_streak >= DEDUP_MAX_CONSECUTIVE_FAILURES:
+            print(f"[FATAL] 去重查询连续失败 {dedup_fail_streak} 篇，整跑中止（防批量重复建页）。")
+            print(f"[FATAL] 已处理结果已落盘 {PREV_RESULTS_FILE}，进度文件未推进。")
+            sys.exit(2)
+        continue
+    dedup_fail_streak = 0
+
+    if notion_exists:
         print(f"  [{idx}] SKIP（Notion 已存在）- {entry['title'][:50]}")
         entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
                         'doc_id': doc_id, 'reason': 'notion_exists'}
