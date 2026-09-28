@@ -19,8 +19,13 @@ DEDUP_MAX_CONSECUTIVE_FAILURES = 2   # 去重查询连续失败这么多篇就�
 
 # 迁移配置
 BATCH_SIZE = 10
-MAX_CONTENT_CHARS = 50000     # 正文最大长度（唯一来源，不要在别处再写一遍）
+MAX_CONTENT_CHARS = 50000     # 单片最大字符数（唯一来源，不要在别处再写一遍）
 SLEEP_INTERVAL = 0.3          # API 调用间隔（秒）
+
+# 拆分（长文档按标题切分）
+SPLIT_MIN_LEVEL = 2           # 从 h2 开始拆（h1 视为文档标题，不拆）
+SPLIT_MAX_LEVEL = 6           # 拆到 h6
+SPLIT_MIN_CHUNK = 5120        # 章节小于此并入上一节（第 0 片例外，永远独立）
 
 # 路径（留空 = 用内置默认，见 cli.py）
 STATE_DIR = ""    # 默认 <repo>/state

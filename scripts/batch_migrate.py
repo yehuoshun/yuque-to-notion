@@ -203,8 +203,10 @@ def notion_attach_images(page_id, upload_map, markdown):
 URL_PATTERN = r'https?://[^\s"<>\')\]]+'
 
 # 拆分阈值（Notion Markdown API 隐式大小限制）
-# MAX_CONTENT_CHARS 来自 cli（config.py 是唯一来源，别在别处再定义一次）
-MIN_CHUNK_BYTES = 5 * 1024  # 章节 < 5KB 不独立成页，合并到上一章
+# MAX_CONTENT_CHARS / MIN_CHUNK_BYTES 均来自 cli（config.py 是唯一来源）
+MIN_CHUNK_BYTES = S.split_min_chunk   # 章节小于此并入上一节
+SPLIT_MIN_LEVEL = S.split_min_level
+SPLIT_MAX_LEVEL = S.split_max_level
 
 def mcpcall(tool, args, retries=3):
     cmd = ['mcporter', 'call', tool, '--args', json.dumps(args), '--output', 'json']
@@ -314,57 +316,184 @@ def check_notion_exists(yuque_url):
     raise NotionInitError(f'去重查询连续失败 {DEDUP_QUERY_RETRIES} 次（限流/5xx）')
 
 
-def split_markdown_by_headings(markdown, threshold=MAX_CONTENT_CHARS, min_chunk=MIN_CHUNK_BYTES):
-    """按 ##/### 拆分长 markdown。返回 [(chapter_title, content), ...]"""
+# ── 标题/围栏识别 ──
+HEADING_RE = re.compile(r'^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$')
+FENCE_RE = re.compile(r'^\s{0,3}(`{3,}|~{3,})(.*)$')
+
+
+def _fence_open(line):
+    """这行是不是围栏开始（返回标记串，如 '```' / '~~~~'）；不是返回 None"""
+    m = FENCE_RE.match(line)
+    if not m:
+        return None
+    marker = m.group(1)
+    if marker[0] == '`' and '`' in m.group(2):   # 行内反引号，不是围栏
+        return None
+    return marker
+
+
+def _fence_close(line, marker):
+    """这行是不是 marker 对应围栏的结束（长度≥开护栏、后面只有空白）"""
+    m = FENCE_RE.match(line)
+    if not m:
+        return False
+    return m.group(1)[0] == marker[0] and len(m.group(1)) >= len(marker) and not m.group(2).strip()
+
+
+def _heading(line, min_level, max_level):
+    """这行是不是目标层级的标题（返回标题文本）；不是返回 None"""
+    m = HEADING_RE.match(line)
+    if not m:
+        return None
+    lvl = len(m.group(1))
+    if min_level <= lvl <= max_level:
+        return m.group(2).strip()
+    return None
+
+
+def split_markdown_by_headings(markdown, threshold=MAX_CONTENT_CHARS, min_chunk=MIN_CHUNK_BYTES,
+                               min_level=SPLIT_MIN_LEVEL, max_level=SPLIT_MAX_LEVEL):
+    """按标题拆分长 markdown。
+    保证：
+      1. 不切进代码围栏（``` / ~~~ 配对识别，围栏内的 ## 不当标题）
+      2. 首个标题之前的内容独立成第 0 片（不丢引言）
+      3. 只认 min_level~max_level 级标题
+      4. 单片超阈值 → 在围栏外的行边界二次切分；切在代码块里则闭合+重开围栏，内容一字不丢
+    返回 [(section_title|None, content), ...]
+    """
+    if not markdown:
+        return [(None, '')]
     if len(markdown) <= threshold:
         return [(None, markdown)]
 
-    # 按 ## 或 ### 标题拆分
-    pattern = re.compile(r'^(#{2,3})\s+(.+)$', re.MULTILINE)
-    matches = list(pattern.finditer(markdown))
+    sections = _split_sections(markdown, min_level, max_level)
+    merged = _merge_small_sections(sections, min_chunk)
 
-    if not matches:
-        # 没有标题可拆分 → 硬截断
-        return [(None, markdown[:threshold] + '\n\n...（内容过长已截断）')]
+    out = []
+    for title, content in merged:
+        parts = _split_oversize(content, threshold)
+        base = title or '（无标题）'
+        for i, part in enumerate(parts):
+            t = title if i == 0 else f'{base}·续{i + 1}'
+            out.append((t, part))
+    if not out:
+        return [(None, markdown)]
+    return out
 
-    chunks = []
-    for i, m in enumerate(matches):
-        start = m.start()
-        end = matches[i+1].start() if i+1 < len(matches) else len(markdown)
-        heading_text = m.group(2).strip()[:80]
-        content = markdown[start:end].strip()
 
-        if len(content) < min_chunk and chunks:
-            prev_title, prev_content = chunks.pop()
-            chunks.append((prev_title, prev_content + '\n\n' + content))
+def _split_sections(markdown, min_level, max_level):
+    """单遍扫描，带围栏状态机，按目标层级标题断章。返回 [(title, content)]"""
+    sections = []
+    cur_title, cur_lines = None, []
+    fence = None
+    for ln in markdown.split('\n'):
+        if fence is None:
+            m = _fence_open(ln)
+            if m:
+                fence = m
+                cur_lines.append(ln)
+                continue
+            h = _heading(ln, min_level, max_level)
+            if h:
+                sections.append((cur_title, '\n'.join(cur_lines).strip()))
+                cur_title, cur_lines = h, [ln]
+                continue
+            cur_lines.append(ln)
         else:
-            chunks.append((heading_text, content))
+            cur_lines.append(ln)
+            if _fence_close(ln, fence):
+                fence = None
+    sections.append((cur_title, '\n'.join(cur_lines).strip()))
+    # 去掉空片（但保留有标题的空片）
+    return [(t, c) for t, c in sections if c or t]
 
-    return chunks
+
+def _merge_small_sections(sections, min_chunk):
+    """短章节并入上一节；第 0 片（引言）不会被吞"""
+    merged = []
+    for title, content in sections:
+        if merged and content and len(content) < min_chunk:
+            pt, pc = merged.pop()
+            merged.append((pt, (pc + '\n\n' + content).strip()))
+        else:
+            merged.append((title, content))
+    return merged
+
+
+def _split_oversize(content, threshold):
+    """超阈值内容按行切分；切在代码块内则闭合当前围栏并在下一片重开。
+    断点在"加行之前"判定，所以每片 ≤ threshold；
+    例外：单行本身超阈值（无法再切）→ 原样保留，由调用方记账告警。"""
+    if len(content) <= threshold:
+        return [content]
+    parts = []
+    buf, buf_len = [], 0
+    fence_marker, fence_line = None, None
+
+    def flush():
+        nonlocal buf, buf_len
+        if buf:
+            parts.append('\n'.join(buf).strip('\n'))
+        buf, buf_len = [], 0
+
+    for ln in content.split('\n'):
+        add = len(ln) + 1
+        in_fence = fence_marker is not None
+        closing = in_fence and _fence_close(ln, fence_marker)
+        if buf and buf_len + add > threshold and not closing:
+            if in_fence:
+                buf.append(fence_marker)        # 先闭合当前围栏
+                flush()
+                if fence_line:
+                    buf = [fence_line]          # 下一片重开同语言围栏
+                    buf_len = len(fence_line) + 1
+            else:
+                flush()
+
+        buf.append(ln)
+        buf_len += add
+
+        if fence_marker is None:
+            m = _fence_open(ln)
+            if m:
+                fence_marker, fence_line = m, ln
+        elif closing:
+            fence_marker, fence_line = None, None
+
+    flush()
+    return [p for p in parts if p] or [content]
 
 
 def write_markdown_and_images(page_id, markdown_slice, img_list, tag_str, skip_markdown=False):
     """写 markdown + 图片。
     返回 (ok: bool, detail: str, imgs_ok: int, imgs_total: int)
-    ok=False 只代表 markdown 写入失败（图片缺失不算整片失败，记 detail）。"""
+    ok=False 代表 markdown 没完整写入（失败或被截断）；图片缺失不算，记 detail。"""
+    flags = []
     base64_total = sum(1 for src, _, _ in img_list if src and src.startswith('data:image/'))
     if not skip_markdown:
         if not markdown_slice:
             return True, 'ok(空)', 0, base64_total
         if len(markdown_slice) > MAX_CONTENT_CHARS:
-            markdown_slice = markdown_slice[:MAX_CONTENT_CHARS] + '\n\n...（内容过长已截断）'
+            # 安全网：拆分器保证正常不会走到这；真走到了也不静默砍，记 flag 让上层判 PARTIAL
+            orig = len(markdown_slice)
+            markdown_slice = markdown_slice[:MAX_CONTENT_CHARS]
+            flags.append(f'truncated:{orig}->{MAX_CONTENT_CHARS}')
+            print(f"        ⚠ 单片超长被截断（{orig} → {MAX_CONTENT_CHARS} 字）")
         status = update_page_markdown(page_id, markdown_slice)
         if status not in (200, 201):
             return False, f'markdown_failed:{status}', 0, base64_total
     if base64_total == 0:
-        return True, 'ok', 0, 0
+        detail = '; '.join(['ok'] + flags) if flags else 'ok'
+        return (not flags), detail, 0, 0
     upload_map, up_fail = notion_upload_images(img_list)
     attached, at_fail = notion_attach_images(page_id, upload_map, markdown_slice)
     detail = f'imgs={attached}/{base64_total}'
     n_fail = len(up_fail) + len(at_fail)
     if n_fail:
         detail += f' fail={n_fail}'
-    return True, detail, attached, base64_total
+    if flags:
+        detail += '; ' + '; '.join(flags)
+    return (not flags), detail, attached, base64_total
 
 
 def repair_pages(records, entries):

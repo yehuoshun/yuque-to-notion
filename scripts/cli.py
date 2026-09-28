@@ -33,6 +33,9 @@ class Settings:
     user: str
     batch_size: int
     max_content_chars: int
+    split_min_level: int
+    split_max_level: int
+    split_min_chunk: int
     dedup_query_retries: int
     dedup_max_consecutive_failures: int
     state_dir: str
@@ -169,6 +172,9 @@ def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
     if args.batch_size is not None:
         src['batch_size'] = '命令行'
     max_content_chars = cfg_int('max_content_chars', 'MAX_CONTENT_CHARS', 50000)
+    split_min_level = cfg_int('split_min_level', 'SPLIT_MIN_LEVEL', 2)
+    split_max_level = cfg_int('split_max_level', 'SPLIT_MAX_LEVEL', 6)
+    split_min_chunk = cfg_int('split_min_chunk', 'SPLIT_MIN_CHUNK', 5120)
     dedup_query_retries = cfg_int('dedup_query_retries', 'DEDUP_QUERY_RETRIES', 3)
     dedup_max_consecutive_failures = cfg_int('dedup_max_consecutive_failures',
                                             'DEDUP_MAX_CONSECUTIVE_FAILURES', 2)
@@ -201,6 +207,8 @@ def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
         mode=mode, notion_db_id=db_id or '', notion_ds_id=ds_id or '',
         dedup_property=dedup_property, book_id=book_id or '', namespace=namespace,
         user=user, batch_size=batch_size, max_content_chars=max_content_chars,
+        split_min_level=split_min_level, split_max_level=split_max_level,
+        split_min_chunk=split_min_chunk,
         dedup_query_retries=dedup_query_retries,
         dedup_max_consecutive_failures=dedup_max_consecutive_failures,
         state_dir=state_dir, entries_file=entries_file,
@@ -230,6 +238,8 @@ def print_config(s):
         ('user', s.user, 'user'),
         ('batch_size', s.batch_size, 'batch_size'),
         ('max_content_chars', s.max_content_chars, 'max_content_chars'),
+        ('split_levels', f'{s.split_min_level}-{s.split_max_level} h级', 'split_min_level'),
+        ('split_min_chunk', s.split_min_chunk, 'split_min_chunk'),
         ('state_dir', s.state_dir, 'state_dir'),
         ('entries_file', s.entries_file, 'entries_file'),
         ('progress_file', s.progress_file, 'progress_file'),
