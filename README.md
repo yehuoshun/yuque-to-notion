@@ -57,6 +57,8 @@ python3 scripts/batch_migrate.py --print-config  # 看当前实际生效值 + �
 | `--state-dir` | `YUQUE2NOTION_STATE_DIR` | 状态目录，默认 `<repo>/state/` |
 | `--env-file` | `OPENCLAW_CREDENTIALS` | 凭据文件，默认 `~/.openclaw/secrets/credentials.env` |
 | `--dry-run` | — | 只探活 + 列批次，不写任何东西 |
+| `--reset-cursor` | — | 游标归零重扫（清单指纹变化时用） |
+| `--resume-write` / `--only-images` | — | 补写模式：按记录里的 page_id 补正文 / 只补图 |
 
 常用例子：
 
@@ -72,9 +74,9 @@ python3 scripts/batch_migrate.py --dry-run
 
 | 模式 | 说明 |
 |---|---|
-| `resume`（默认） | 从进度文件继续；已完成/已在 Notion 的自动跳过 |
-| `new` | 清掉进度和结果，从头开始 |
-| `retry-failed` | 只重跑上轮失败的 |
+| `resume`（默认） | 从游标继续；已完成/已在 Notion 的自动跳过 |
+| `new` | 重置进度、结果与重试队列，从头开始 |
+| `retry-failed` | 消费重试队列（按 `--batch-size` 分批） |
 
 ```bash
 python3 scripts/batch_migrate.py --mode retry-failed
@@ -82,8 +84,20 @@ python3 scripts/batch_migrate.py --mode retry-failed
 
 ### 状态文件
 
-默认落在 `<repo>/state/`（可用 `--state-dir` 改）：`progress.txt`、`prev_results.json`、`yuque_entries.json`。
-每篇处理完立刻落盘，进程中断不丢结果；重启机器也不丢。
+默认落在 `<repo>/state/`（可用 `--state-dir` 改）：
+
+| 文件 | 作用 |
+|---|---|
+| `progress.json` | 游标，按 `book_id:notion_db_id` 分桶，带清单指纹与上批计数 |
+| `prev_results.json` | 每篇的账，按 doc_id 合并（状态取优先级最高） |
+| `retry_queue.json` | 重试队列（`--mode retry-failed` 逐篇消费） |
+| `yuque_entries.json` | `build_entries.py` 生成的条目清单 |
+| `progress.txt` | 旧格式镜像（只写数字，兼容/便于人看） |
+
+每篇处理完立刻落盘 → 进程崩溃或机器重启最多重来 1 篇。
+
+游标只增不减；整批全部失败（无 OK/PARTIAL/SKIP）时会回滚到批首并 `exit 2`，提示疑似风控/网络故障。
+清单指纹不一致（重跑了 `build_entries.py` 导致顺序变化）会拒绝沿用旧游标，需显式 `--reset-cursor`。
 
 ## 注意事项
 
@@ -92,3 +106,4 @@ python3 scripts/batch_migrate.py --mode retry-failed
 - 专有名词（如 MyBatis-Plus）自动合并为 MyBatisPlus
 - 标签上限 15 个
 - 配置或目标库有问题时**直接报错退出**（`exit 2`），不会静默跑错库
+- 状态结果：`OK`（完成）/ `PARTIAL`（页建了但正文没写全）/ `FAIL` / `RATE_LIMITED` / `SKIP`（垃圾或已迁）
