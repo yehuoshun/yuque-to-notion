@@ -2,6 +2,7 @@ import base64, subprocess, json, urllib.parse, re, time, sys, os
 import requests
 from lake_convert import lake_to_markdown
 from cli import load_settings, ConfigError, ensure_state_dir
+import state_store as st
 
 # ── 生效配置（命令行 > 环境变量 > config.py），全部从 cli 拿 ──
 S = load_settings(prog='batch_migrate')
@@ -15,6 +16,8 @@ DEDUP_MAX_CONSECUTIVE_FAILURES = S.dedup_max_consecutive_failures
 DATA_FILE = S.entries_file
 PROGRESS_FILE = S.progress_file
 PREV_RESULTS_FILE = S.prev_results_file
+PROGRESS_JSON = os.path.join(S.state_dir, 'progress.json')
+RETRY_QUEUE_FILE = os.path.join(S.state_dir, 'retry_queue.json')
 MAX_CONTENT_CHARS = S.max_content_chars
 BATCH_SIZE = S.batch_size
 YUQUE_BOOK_ID = S.book_id
@@ -251,20 +254,21 @@ def fetch_doc_with_retry(entry, book_id, max_retries=2):
             time.sleep(60)
     return None, 'RATE_LIMITED'
 
-def save_result(result_json):
-    """每篇处理完立即写盘，进程中断不丢结果"""
-    tmp_path = PREV_RESULTS_FILE + '.tmp'
-    try:
-        existing = []
-        if os.path.exists(PREV_RESULTS_FILE):
-            with open(PREV_RESULTS_FILE) as f:
-                existing = json.load(f)
-        existing.append(result_json)
-        with open(tmp_path, 'w') as f:
-            json.dump(existing, f, ensure_ascii=False, indent=1)
-        os.replace(tmp_path, PREV_RESULTS_FILE)
-    except Exception as e:
-        print(f"    [save] 写盘失败: {e}")
+def save_result(result_json, idx=None):
+    """落盘一篇结果（同 doc_id 合并），并维护游标/重试队列。
+    idx 给了就同时推进游标（每篇落盘，崩溃最多重来 1 篇）。"""
+    st.upsert_result(PREV_RESULTS_FILE, result_json)
+    doc_id = str(result_json.get('doc_id', ''))
+    if MODE == 'retry-failed':
+        st.queue_remove(RETRY_QUEUE_FILE, doc_id)
+    if result_json.get('status') in ('FAIL', 'RATE_LIMITED'):
+        st.queue_add(RETRY_QUEUE_FILE, [doc_id])
+    if idx is not None and MODE != 'retry-failed':
+        try:
+            st.update_cursor(progress, JOB_KEY, idx + 1)
+        except ValueError as e:
+            print(f'    [progress] ⚠️ {e}')
+        st.save_progress(PROGRESS_JSON, progress)
 
 def doc_body_precheck(result, entry):
     """文档预检：R1 二进制 / R2 数据库dump / R8 无意义内容。返回 (pass: bool, reason: str|None)"""
@@ -518,37 +522,7 @@ except NotionInitError as e:
     print('[FATAL] 未做任何写入，未推进进度。修好 config 再跑。')
     sys.exit(2)
 
-start_idx = 0
-processed_ids = set()
-failed_ids = []  # 仅 retry-failed 使用
-
-if MODE == 'retry-failed':
-    # 从已有结果里挑出失败的 doc_id
-    if os.path.exists(PREV_RESULTS_FILE):
-        try:
-            with open(PREV_RESULTS_FILE) as f:
-                for r in json.load(f):
-                    if r.get('status') in ('FAIL', 'RATE_LIMITED'):
-                        failed_ids.append(r.get('doc_id', ''))
-        except Exception:
-            pass
-    print(f'[mode=retry-failed] 待重试: {len(failed_ids)} 篇')
-else:
-    # resume / new: 从进度文件读索引起点
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            start_idx = int(f.read().strip())
-
-    # 加载已成功的 doc_id（resume 时跳过，new 时不起作用因为文件已删）
-    if os.path.exists(PREV_RESULTS_FILE):
-        try:
-            with open(PREV_RESULTS_FILE) as f:
-                for r in json.load(f):
-                    if r.get('status') == 'OK':
-                        processed_ids.add(r.get('doc_id', ''))
-        except Exception:
-            pass
-
+# ───── 载入条目（进度校验/指纹都要它）─────
 if not os.path.exists(DATA_FILE):
     print(f'[FATAL] 条目文件不存在: {DATA_FILE}')
     print('[FATAL] 先跑 build_entries.py 生成（可用 --book-id 指定知识库）。')
@@ -556,13 +530,15 @@ if not os.path.exists(DATA_FILE):
 with open(DATA_FILE) as f:
     entries = json.load(f)
 
+ENTRY_FP = st.entries_fingerprint(entries)
+JOB_KEY = st.job_key(S.book_id, S.notion_db_id)
+
 # ── 补写模式：只往已存在的页补，不建页/不去重/不推进度 ──
 if S.resume_write:
-    if not os.path.exists(PREV_RESULTS_FILE):
-        print(f'[FATAL] 没有结果文件可补：{PREV_RESULTS_FILE}')
+    all_recs = st.load_results(PREV_RESULTS_FILE)
+    if not all_recs:
+        print(f'[FATAL] 没有结果可补：{PREV_RESULTS_FILE}')
         sys.exit(2)
-    with open(PREV_RESULTS_FILE) as f:
-        all_recs = json.load(f)
     if S.only_images:
         records = [r for r in all_recs if r.get('imgs_total', 0) > r.get('imgs_ok', 0)]
     else:
@@ -575,30 +551,93 @@ if S.resume_write:
         sys.exit(0)
     sys.exit(repair_pages(records, entries))
 
-# 构建批次：resume/new 按索引连续取；retry-failed 只取失败的那些
-if MODE == 'retry-failed':
-    batch = [e for e in entries if str(e['doc_id']) in failed_ids]
-    # retry-failed 不计入进度文件索引，批次完成后不推进 start_idx
-    end_idx = start_idx + len(batch)
+# ───── 任务进度（按 book:db 分桶，带清单指纹）─────
+progress = st.load_progress(PROGRESS_JSON)
+job = st.get_job(progress, JOB_KEY)
+legacy_cursor = 0
+# 只在"从没写过 progress.json"时迁旧文件（且只做一次）。否则新任务会继承别的书的游标
+if job is None and not os.path.exists(PROGRESS_JSON) and os.path.exists(PROGRESS_FILE):
+    try:
+        legacy_cursor = int((open(PROGRESS_FILE).read() or '0').strip() or 0)
+        print(f'[progress] 迁移旧 progress.txt → progress.json（游标 {legacy_cursor}，归属未校验）')
+    except Exception:
+        legacy_cursor = 0
+if job is None:
+    st.set_job(progress, JOB_KEY, st.new_job(S.book_id, S.notion_db_id, len(entries), ENTRY_FP,
+                                             cursor=legacy_cursor))
+    st.save_progress(PROGRESS_JSON, progress)
+    print(f'[progress] 新建任务 {JOB_KEY}（{len(entries)} 篇）')
+else:
+    fp_changed = bool(job.get('entries_fingerprint')) and job['entries_fingerprint'] != ENTRY_FP
+    if fp_changed and not S.reset_cursor:
+        print('[FATAL] 条目清单变了，与进度记录对不上：')
+        print(f"[FATAL]   进度内: {job['entries_fingerprint']}（{job.get('entries_count')} 篇）")
+        print(f"[FATAL]   当前:   {ENTRY_FP}（{len(entries)} 篇）")
+        print('[FATAL] 清单顺序变了却沿用旧游标会静默漏篇。确认要重扫这份清单就加 --reset-cursor')
+        sys.exit(2)
+    if fp_changed:
+        print('[progress] --reset-cursor：清单指纹已变更，游标归零重扫')
+    elif S.reset_cursor:
+        print('[progress] --reset-cursor：游标归零')
+    if S.reset_cursor or fp_changed:
+        st.update_cursor(progress, JOB_KEY, 0, allow_decrease=True)
+        job['entries_fingerprint'] = ENTRY_FP
+        job['entries_count'] = len(entries)
+        st.save_progress(PROGRESS_JSON, progress)
+
+start_idx = int(st.get_job(progress, JOB_KEY).get('cursor', 0))
+
+# 已处理的 doc_id：OK/PARTIAL 都算（PARTIAL 另有一条 --resume-write 补写通道）
+merged_records = st.load_results(PREV_RESULTS_FILE)
+processed_ids = {str(r.get('doc_id')) for r in merged_records if r.get('status') in ('OK', 'PARTIAL')}
+
+# ───── 构建批次 ─────
+batch_start_cursor = start_idx
+if MODE == 'new':
+    print('[mode=new] 重置进度 / 结果 / 重试队列')
+    st.update_cursor(progress, JOB_KEY, 0, allow_decrease=True)
+    st.save_progress(PROGRESS_JSON, progress)
+    st.save_results(PREV_RESULTS_FILE, [])
+    st.save_queue(RETRY_QUEUE_FILE, [])
+    processed_ids = set()
+    start_idx = batch_start_cursor = 0
+    end_idx = min(BATCH_SIZE, len(entries))
+    batch = entries[:end_idx]
     if not batch:
-        print("ALL_DONE (no failed docs to retry)")
+        print('ALL_DONE')
         sys.exit(0)
-    print(f"RETRY-FAILED BATCH: {len(batch)}/{len(entries)} docs")
+    print(f'BATCH: 0-{end_idx-1}/{len(entries)}')
+elif MODE == 'retry-failed':
+    q = st.load_queue(RETRY_QUEUE_FILE)
+    if not q:
+        q = [str(r.get('doc_id')) for r in merged_records
+             if r.get('status') in ('FAIL', 'RATE_LIMITED')]
+        st.save_queue(RETRY_QUEUE_FILE, q)
+        print(f'[mode=retry-failed] 队列为空，从结果文件重建 {len(q)} 篇')
+    by_id = {str(e['doc_id']): e for e in entries}
+    batch = [by_id[d] for d in q[:BATCH_SIZE] if d in by_id]
+    if not batch:
+        print('ALL_DONE (no failed docs to retry)')
+        sys.exit(0)
+    print(f'RETRY-FAILED BATCH: {len(batch)}（队列共 {len(q)}）')
 else:
     end_idx = min(start_idx + BATCH_SIZE, len(entries))
     batch = entries[start_idx:end_idx]
     if not batch:
-        print("ALL_DONE")
+        print('ALL_DONE')
         sys.exit(0)
-    print(f"BATCH: {start_idx}-{end_idx-1}/{len(entries)}")
+    qn = len(st.load_queue(RETRY_QUEUE_FILE))
+    print(f'BATCH: {start_idx}-{end_idx-1}/{len(entries)}' + (f' | 重试队列待处理 {qn} 篇（跑 --mode retry-failed 清）' if qn else ''))
 
 print()
 
 if S.dry_run:
+    j = st.get_job(progress, JOB_KEY) or {}
     print('[dry-run] 仅探活 + 列批次，不写任何东西')
+    print(f"[dry-run] 任务={JOB_KEY} 游标={j.get('cursor')} 清单指纹={j.get('entries_fingerprint')}")
     print(f'[dry-run] 模式={MODE} 本次待处理 {len(batch)} 篇')
-    for j, e in enumerate(batch):
-        print(f'   [{start_idx + j}] {e["doc_id"]}  {str(e.get("title", ""))[:60]}')
+    for k, e in enumerate(batch):
+        print(f'   [{start_idx + k}] {e["doc_id"]}  {str(e.get("title", ""))[:60]}')
     print('[dry-run] 结束，未写入任何内容')
     sys.exit(0)
 
@@ -611,7 +650,9 @@ for i, entry in enumerate(batch):
     # ───── 去重：本地已记录 ─────
     if doc_id in processed_ids:
         print(f"  [{idx}] SKIP（已迁移）- {entry['title'][:50]}")
-        results.append({'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50], 'doc_id': doc_id})
+        entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50], 'doc_id': doc_id}
+        results.append(entry_result)
+        save_result(entry_result, idx)
         continue
 
     # ───── 取文档 ─────
@@ -621,7 +662,7 @@ for i, entry in enumerate(batch):
         print(f"  [{idx}] {status}: {entry['title'][:50]}")
         entry_result = {'idx': idx, 'status': status, 'title': entry['title'][:50], 'doc_id': doc_id}
         results.append(entry_result)
-        save_result(entry_result)
+        save_result(entry_result, idx)
         continue
 
     body = result.get('body', '')
@@ -633,7 +674,7 @@ for i, entry in enumerate(batch):
         entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
                         'doc_id': doc_id, 'reason': precheck_reason}
         results.append(entry_result)
-        save_result(entry_result)
+        save_result(entry_result, idx)
         continue
 
     # ───── lake → markdown ─────
@@ -666,7 +707,7 @@ for i, entry in enumerate(batch):
         entry_result = {'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50],
                         'doc_id': doc_id, 'reason': 'dedup_query_failed'}
         results.append(entry_result)
-        save_result(entry_result)
+        save_result(entry_result, idx)
         if dedup_fail_streak >= DEDUP_MAX_CONSECUTIVE_FAILURES:
             print(f"[FATAL] 去重查询连续失败 {dedup_fail_streak} 篇，整跑中止（防批量重复建页）。")
             print(f"[FATAL] 已处理结果已落盘 {PREV_RESULTS_FILE}，进度文件未推进。")
@@ -679,7 +720,7 @@ for i, entry in enumerate(batch):
         entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
                         'doc_id': doc_id, 'reason': 'notion_exists'}
         results.append(entry_result)
-        save_result(entry_result)
+        save_result(entry_result, idx)
         continue
 
     # ───── 拆分 Big Doc ─────
@@ -692,7 +733,7 @@ for i, entry in enumerate(batch):
         entry_result = {'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50],
                         'doc_id': doc_id, 'reason': 'create_page_failed'}
         results.append(entry_result)
-        save_result(entry_result)
+        save_result(entry_result, idx)
         continue
     main_page_id = page['id']
 
@@ -766,27 +807,47 @@ for i, entry in enumerate(batch):
                     'imgs_ok': imgs_ok_total, 'imgs_total': imgs_total_total,
                     'detail': detail}
     results.append(entry_result)
-    save_result(entry_result)
+    save_result(entry_result, idx)
     time.sleep(20)
 
-# ───── 保存进度 ─────
+# ───── 保存进度 / 批次收尾 ─────
 ok = sum(1 for r in results if r['status'] == 'OK')
 partial = sum(1 for r in results if r['status'] == 'PARTIAL')
 skipped = sum(1 for r in results if r['status'] == 'SKIP')
 failed = sum(1 for r in results if r['status'] in ('FAIL', 'RATE_LIMITED'))
+productive = ok + partial + skipped
+last_batch = {'ok': ok, 'partial': partial, 'skip': skipped, 'fail': failed}
 
 if MODE == 'retry-failed':
-    # retry-failed 不推进索引进度（不影响 normal 的批次位置）
-    print(f"\nDONE: retry-failed | OK={ok} PARTIAL={partial} FAIL={failed} SKIP={skipped}")
+    qn = len(st.load_queue(RETRY_QUEUE_FILE))
+    print(f"\nDONE: retry-failed | OK={ok} PARTIAL={partial} FAIL={failed} SKIP={skipped} | 队列剩 {qn}")
+    if qn:
+        print(f"NEXT: 继续跑 --mode retry-failed（还剩 {qn} 篇）")
+    else:
+        print("ALL_DONE (重试队列已清空)")
 else:
-    actually_consumed = sum(1 for r in results if r['status'] != 'SKIP')
-    next_start = start_idx + actually_consumed
-    with open(PROGRESS_FILE, 'w') as f:
-        f.write(str(next_start))
-    print(f"\nDONE: start={start_idx} | OK={ok} PARTIAL={partial} FAIL={failed} SKIP(已迁移)={skipped} | 下次: {next_start}")
+    cursor_after = int(st.get_job(progress, JOB_KEY).get('cursor', 0))
+
+    # 安全阀：整批全废（无 OK/PARTIAL/SKIP）→ 回滚游标到批首，停跑
+    if len(batch) > 0 and productive == 0:
+        st.update_cursor(progress, JOB_KEY, batch_start_cursor, allow_decrease=True,
+                         last_batch=last_batch)
+        st.save_progress(PROGRESS_JSON, progress)
+        print(f"\n[FATAL] 本批 {len(batch)} 篇全部失败（无 OK/PARTIAL/SKIP）→ 疑似语雀风控或网络故障。")
+        print(f"[FATAL] 游标已回滚到批首 {batch_start_cursor}，未推进。稍后重跑即可续上。")
+        sys.exit(2)
+
+    st.update_cursor(progress, JOB_KEY, cursor_after, last_batch=last_batch)
+    st.save_progress(PROGRESS_JSON, progress)
+    with open(PROGRESS_FILE, 'w') as f:   # 老格式镜像，方便人看/兼容
+        f.write(str(cursor_after))
+
+    print(f"\nDONE: start={start_idx} | OK={ok} PARTIAL={partial} FAIL={failed} SKIP={skipped} | 游标: {cursor_after}/{len(entries)}")
+    if failed:
+        print(f"HINT: {failed} 篇失败已进重试队列，跑 --mode retry-failed 补")
     if partial:
-        print(f"HINT: {partial} 篇不完整，可跑 --resume-write 补写（--only-images 只补图）")
-    if next_start >= len(entries):
+        print(f"HINT: {partial} 篇不完整，跑 --resume-write 补写（--only-images 只补图）")
+    if cursor_after >= len(entries):
         print("ALL_DONE")
     else:
-        print(f"NEXT: {next_start}/{len(entries)}")
+        print(f"NEXT: {cursor_after}/{len(entries)}")

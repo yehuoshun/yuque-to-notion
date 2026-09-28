@@ -44,6 +44,7 @@ class Settings:
     dry_run: bool
     resume_write: bool
     only_images: bool
+    reset_cursor: bool
     notion_token: str
     sources: dict  # 字段 -> 生效来源，供 --print-config 用
 
@@ -76,6 +77,8 @@ def build_parser(prog='batch_migrate'):
                    help='补写模式：只往上次结果里已存在的页补正文（PARTIAL 记录），不建页、不推进度')
     p.add_argument('--only-images', dest='only_images', action='store_true',
                    help='配合 --resume-write：只补图片，不重写正文（用于 imgs 缺失的记录）')
+    p.add_argument('--reset-cursor', dest='reset_cursor', action='store_true',
+                   help='把本任务的游标归零重扫（清单指纹变化时需显式指定）')
     p.add_argument('--print-config', dest='print_config', action='store_true',
                    help='打印生效配置（token 打码）后退出')
     return p
@@ -206,6 +209,7 @@ def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
         env_file=env_file, mcp_cwd=mcp_cwd, dry_run=bool(args.dry_run),
         resume_write=bool(args.resume_write) or bool(args.only_images),
         only_images=bool(args.only_images),
+        reset_cursor=bool(args.reset_cursor),
         notion_token=notion_token, sources=src)
 
     if args.print_config:
@@ -235,6 +239,7 @@ def print_config(s):
         ('dry_run', s.dry_run, 'dry_run'),
         ('resume_write', s.resume_write, 'resume_write'),
         ('only_images', s.only_images, 'only_images'),
+        ('reset_cursor', s.reset_cursor, 'reset_cursor'),
         ('NOTION_TOKEN', _mask(s.notion_token), 'notion_token'),
     ]
     print('生效配置（命令行 > 环境变量 > config.py）')
