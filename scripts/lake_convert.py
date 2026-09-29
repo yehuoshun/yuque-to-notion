@@ -1,4 +1,4 @@
-import json, re, urllib.parse, subprocess, sys, os, requests, base64
+import json, re, urllib.parse, subprocess, sys
 from cli import load_settings
 
 def decode_card_value(raw_val):

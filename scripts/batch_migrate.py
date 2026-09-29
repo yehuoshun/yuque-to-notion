@@ -273,7 +273,7 @@ def save_result(result_json, idx=None):
             print(f'    [progress] ⚠️ {e}')
         st.save_progress(PROGRESS_JSON, progress)
 
-def doc_body_precheck(result, entry):
+def doc_body_precheck(result):
     """文档预检：R1 二进制 / R2 数据库dump / R8 无意义内容。返回 (pass: bool, reason: str|None)"""
     body = result.get('body', '')
     word_count = result.get('word_count', 0)
@@ -295,11 +295,6 @@ def doc_body_precheck(result, entry):
     if not has_card and readable < 10 and word_count < 5:
         return False, 'R8_无意义内容'
     return True, None
-
-
-def check_notion_exists(yuque_url):
-    """兼容旧接口：是否已经有同判重键的页。新逻辑请用 fetch_existing_pages（要数页数）。"""
-    return bool(fetch_existing_pages(yuque_url))
 
 
 def fetch_existing_pages(yuque_url):
@@ -502,7 +497,7 @@ def _split_oversize(content, threshold):
     return [p for p in parts if p] or [content]
 
 
-def write_markdown_and_images(page_id, markdown_slice, img_items, tag_str, skip_markdown=False):
+def write_markdown_and_images(page_id, markdown_slice, img_items, skip_markdown=False):
     """写 markdown + 图片。
     img_items: [(原图下标, src, link, ext), ...]（分片时只传本片用到的图）
     返回 (ok: bool, detail: str, imgs_ok: int, imgs_total: int)
@@ -536,7 +531,7 @@ def write_markdown_and_images(page_id, markdown_slice, img_items, tag_str, skip_
     return (not flags), detail, attached, base64_total
 
 
-def create_chunk_page(entry, result, ci, chapter_title, tag_str, yuque_url):
+def create_chunk_page(entry, result, ci, chapter_title, yuque_url):
     """补建分片页（resume-write 用）：主页面或子页面。返回 page_id 或 None"""
     title = chunk_page_title(entry.get('title', ''), ci, chapter_title)
     tags = extract_tags(entry.get('title', ''), result.get('body', ''),
@@ -582,8 +577,6 @@ def repair_pages(records, entries):
         markdown, img_list = lake_to_markdown(result.get('body', ''))
         chunks = split_markdown_by_headings(markdown)
         page_ids = rec.get('page_ids') or {}
-        tag_str = '/'.join(extract_tags(e.get('title', ''), result.get('body', ''),
-                                        e.get('source', '其他'), e.get('category', '其他'))[:6])
         yuque_url = f'https://www.yuque.com/{YUQUE_USER}/{YUQUE_NAMESPACE}/{result.get("slug", "")}'
         chunks_ok = 0
         imgs_ok_sum = 0
@@ -593,7 +586,7 @@ def repair_pages(records, entries):
             pid = page_ids.get(str(ci)) or page_ids.get(ci)
             if not pid:
                 # 缺 page_id（上次连页都没建成）→ 补建，别丢片
-                pid = create_chunk_page(e, result, ci, ct, tag_str, yuque_url)
+                pid = create_chunk_page(e, result, ci, ct, yuque_url)
                 if not pid:
                     notes.append(f'chunk{ci}:补建页失败')
                     continue
@@ -601,7 +594,7 @@ def repair_pages(records, entries):
                 print(f'    [repair] 补建了第 {ci+1} 片页: {pid}')
             chunk_imgs = images_for_chunk(c, img_list)
             okw, detail, io, it = write_markdown_and_images(
-                pid, c, chunk_imgs, tag_str=tag_str, skip_markdown=S.only_images)
+                pid, c, chunk_imgs, skip_markdown=S.only_images)
             imgs_ok_sum += io
             imgs_total += it
             if okw:
@@ -867,7 +860,7 @@ for i, entry in enumerate(batch):
     body = result.get('body', '')
 
     # ───── 文档预检 ─────
-    precheck_pass, precheck_reason = doc_body_precheck(result, entry)
+    precheck_pass, precheck_reason = doc_body_precheck(result)
     if not precheck_pass:
         print(f"  [{idx}] SKIP ({precheck_reason}) - {entry['title'][:50]}")
         entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
@@ -994,7 +987,7 @@ for i, entry in enumerate(batch):
 
         # 每片只传本片用到的图（原来每片都全量重传，336 图的文档要白传一倍）
         chunk_imgs = images_for_chunk(chapter_content, img_list)
-        okw, detail, io, it = write_markdown_and_images(target_page, chapter_content, chunk_imgs, tag_str)
+        okw, detail, io, it = write_markdown_and_images(target_page, chapter_content, chunk_imgs)
         imgs_ok_total += io
         imgs_total_total += it
         if okw:

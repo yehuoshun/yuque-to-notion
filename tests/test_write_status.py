@@ -92,23 +92,23 @@ def install(fake, markdown_status=200, upload_ok=True, attach_ok=True, block_url
 
 print('== A. write_markdown_and_images 状态判定 ==')
 ns['requests'] = install(FakeReq(), markdown_status=502)
-ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', [], '')
+ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', [])
 check('markdown 502 → (False, markdown_failed:502)', (not ok) and detail.startswith('markdown_failed:502'), detail)
 
 ns['requests'] = install(FakeReq(), markdown_status=200)
-ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', [], '')
+ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', [])
 check('无图 + 200 → OK', ok and io == 0 and it == 0, detail)
 
 fake = install(FakeReq(), markdown_status=200,
                block_urls=['https://n2m.local/img_0.png', 'https://n2m.local/img_1.png'])
 ns['requests'] = fake
-ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(2), '')
+ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(2))
 check('2 图全成 → imgs=2/2', ok and io == 2 and it == 2, detail)
 
 fake = install(FakeReq(), markdown_status=200, upload_ok=False,
                block_urls=['https://n2m.local/img_0.png'])
 ns['requests'] = fake
-ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(2), '')
+ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(2))
 check('上传 500 → imgs=0/2 + fail 记账，正文仍 OK',
       ok and io == 0 and it == 2 and 'fail=2' in detail, detail)
 
@@ -116,7 +116,7 @@ fake = install(FakeReq(), markdown_status=200,
                block_urls=['https://n2m.local/img_0.png', 'https://n2m.local/img_1.png'])
 fake.rules[('PATCH', '/blocks/')] = (500, {})
 ns['requests'] = fake
-ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(2), '')
+ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(2))
 check('贴图 PATCH 全挂 → imgs=0/2 + fail 记账', ok and io == 0 and it == 2 and 'fail=2' in detail, detail)
 
 print('\n== B. 上传 429 重试后成功 ==')
@@ -134,7 +134,7 @@ def flaky_post(url, **kw):
     return real_post(url, **kw)
 fake.post = flaky_post
 ns['requests'] = fake
-ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(1), '')
+ok, detail, io, it = ns['write_markdown_and_images']('p1', '正文', img_list(1))
 check('429 后重试成功 → OK，file_uploads 调了 2 次', ok and io == 1 and calls_to_uploads == 2,
       f'{detail} calls={calls_to_uploads}')
 

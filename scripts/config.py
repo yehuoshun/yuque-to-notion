@@ -20,7 +20,6 @@ DEDUP_MAX_CONSECUTIVE_FAILURES = 2   # 去重查询连续失败这么多篇就�
 # 迁移配置
 BATCH_SIZE = 10
 MAX_CONTENT_CHARS = 50000     # 单片最大字符数（唯一来源，不要在别处再写一遍）
-SLEEP_INTERVAL = 0.3          # API 调用间隔（秒）
 
 # 拆分（长文档按标题切分）
 SPLIT_MIN_LEVEL = 2           # 从 h2 开始拆（h1 视为文档标题，不拆）
