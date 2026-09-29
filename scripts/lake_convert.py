@@ -1,4 +1,4 @@
-import json, re, urllib.parse, subprocess, sys
+import base64, json, re, urllib.parse, subprocess, sys
 from cli import load_settings
 
 def decode_card_value(raw_val):
@@ -67,15 +67,46 @@ LANG_MAP = {'markdown': 'markdown', 'md': 'markdown', 'css': 'css',
 # 图床必须公网可读，等于把语雀私有库图片推到公网，单向不可撤回。
 # 图片失败现在走 batch_migrate 的「记账 + 重试 + --resume-write 后补」。
 
+# 图片魔数（只解 data URI 开头一小段就能判）
+_IMG_MAGIC = [(b'\x89PNG\r\n\x1a\n', 'png'), (b'\xff\xd8\xff', 'jpg'),
+              (b'GIF87a', 'gif'), (b'GIF89a', 'gif'), (b'RIFF', 'webp'), (b'BM', 'bmp')]
+
+
+def _sniff_ext(src, declared=''):
+    """按 base64 字节魔数判扩展名；判不出就回退 declared（不乱猜）。
+    只解前 32 个 base64 字符（≈24 字节），不把整张图解出来。"""
+    try:
+        b64 = src.split(',', 1)[1] if ',' in src else ''
+        head = base64.b64decode(b64[:32] + '=' * ((4 - len(b64[:32]) % 4) % 4))
+    except Exception:
+        return declared or 'png'
+    for magic, ext in _IMG_MAGIC:
+        if head.startswith(magic):
+            if magic == b'RIFF' and head[8:12] != b'WEBP':
+                continue
+            return ext
+    h = head.lstrip()
+    if h.startswith(b'<svg') or h.startswith(b'<?xml') or b'<svg' in head:
+        return 'svg'
+    return declared or 'png'
+
+
 def _ext_from_src(src):
+    """扩展名：URL 图按路径后缀；data URI **按字节魔数嗅探**
+    （不能只信声明的 mime：实测有声明 image/png 实际是 RIFF/WEBP 字节的）"""
+    if not src:
+        return 'png'
+    if src.startswith('data:image/'):
+        declared = ''
+        m2 = re.search(r'data:image/([\w+.-]+)', src)
+        if m2:
+            declared = m2.group(1).lower()
+            declared = {'jpeg': 'jpg', 'svg+xml': 'svg'}.get(declared, declared)
+        return _sniff_ext(src, declared)
     m = re.search(r'\.(png|jpe?g|gif|webp|svg|bmp)', src, re.I)
     if m:
         e = m.group(1).lower()
         return 'jpg' if e == 'jpeg' else e
-    if src.startswith('data:image/'):
-        m2 = re.search(r'data:image/(\w+)', src)
-        if m2:
-            return 'png' if m2.group(1) == 'jpeg' else m2.group(1).lower()
     return 'png'
 
 def lake_to_markdown(body):
