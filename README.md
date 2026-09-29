@@ -27,9 +27,16 @@
 
 ### 前置条件
 
-1. Notion Integration Token 已配置（环境变量 `NOTION_TOKEN`，或 `~/.openclaw/secrets/credentials.env`）
-2. 语雀 MCP（`yuque-mcp`）已配置——本工具走语雀 Web API，需要 cookie + ctoken
-3. 目标 Notion 数据库已创建好字段，且已把该库共享给上面那个 Integration
+1. **Notion Integration Token**：环境变量 `NOTION_TOKEN`，或凭据文件 `~/.openclaw/secrets/credentials.env`
+   - 该 Integration 必须已**共享给目标数据库**（Notion 里打开库页面 → 右上 `···` → 连接 → 添加）。没共享的话探活阶段就直接 `exit 2`
+2. **语雀侧走的是语雀 Web API，认证靠 cookie + ctoken**（**不是** v2 Token）
+   - 配在 `skills/yuque-ai-mcp/config/config.json` 的 `cookie` / `ctoken` 字段
+   - 获取：浏览器登录 yuque.com → `F12` → Application → Cookies，复制 `_yuque_session`（→ `cookie`）和 `yuque_ctoken`（→ `ctoken`）
+   - **过期症状**：抓取返回空 body → 日志刷 `[retry] body 空（疑似风控）` → 大批 `RATE_LIMITED`；重新复制 cookie 即可
+   - 工具**没有 v2 Token 兜底**，cookie 失效就是全线停摆
+3. **目标 Notion 数据库**字段齐备（见上表），且判重字段（默认 `原文链接`）是 `url` 类型
+4. 外部命令 **`mcporter`**（含 yuque-mcp MCP server）在 PATH 里；否则用 `--mcp-cwd` 指向工作区
+5. Python ≥ 3.8，依赖见 `requirements.txt`
 
 ### 运行
 
@@ -56,6 +63,9 @@ python3 scripts/batch_migrate.py --print-config  # 看当前实际生效值 + �
 | `--book-id` / `--namespace` / `--user` | `YUQUE_BOOK_ID` / `YUQUE_NAMESPACE` / `YUQUE_USER` | 语雀知识库 |
 | `--state-dir` | `YUQUE2NOTION_STATE_DIR` | 状态目录，默认 `<repo>/state/` |
 | `--env-file` | `OPENCLAW_CREDENTIALS` | 凭据文件，默认 `~/.openclaw/secrets/credentials.env` |
+| `--mcp-cwd` | `OPENCLAW_WORKSPACE` | mcporter 工作目录 |
+| `--batch-size` | `BATCH_SIZE` | 每批篇数 |
+| — | `MAX_CONTENT_CHARS` / `SPLIT_MIN_LEVEL` / `SPLIT_MAX_LEVEL` / `SPLIT_MIN_CHUNK` | 分片阈值与标题层级 |
 | `--dry-run` | — | 只探活 + 列批次，不写任何东西 |
 | `--reset-cursor` | — | 游标归零重扫（清单指纹变化时用） |
 | `--resume-write` / `--only-images` | — | 补写模式：按记录里的 page_id 补正文 / 只补图 |
@@ -101,12 +111,12 @@ python3 scripts/batch_migrate.py --mode retry-failed
 
 ## 注意事项
 
-- 单个 chunk 超过 `MAX_CONTENT_CHARS`（默认 50000）会被截断
 - 纯数字、单字符标签被过滤
 - 专有名词（如 MyBatis-Plus）自动合并为 MyBatisPlus
 - 标签上限 15 个
 - 配置或目标库有问题时**直接报错退出**（`exit 2`），不会静默跑错库
 - 状态结果：`OK`（完成）/ `PARTIAL`（页建了但正文没写全）/ `FAIL` / `RATE_LIMITED` / `SKIP`（垃圾或已迁）
+- 单片超过 `MAX_CONTENT_CHARS`（默认 50000）会在**围栏外的行边界安全切分**（切在代码块里会闭合+重开围栏），不丢内容；只有「单行本身超长」这种无法再切的情况才截断，并记 `truncated:` 且该片判 `PARTIAL`
 
 ### 语雀卡片转换
 
@@ -122,3 +132,63 @@ python3 scripts/batch_migrate.py --mode retry-failed
 | 表格 / 画板 / 思维导图 / **未知类型** | 可见占位 `> ⚠️ 未转换的语雀卡片：xxx（请回原文查看）`，并在结果里记 `unsupported_cards` |
 
 **任何卡片都不会被静默丢掉**：不认识的类型一律落成可见占位 + 记账。
+
+## 长文档分片
+
+正文转换后超过 `MAX_CONTENT_CHARS`（默认 50000 字）会自动拆成多页：
+
+- 按 `##`~`######` 标题切分（`#` 视为文档标题不切，层级可用 `SPLIT_MIN_LEVEL` / `SPLIT_MAX_LEVEL` 调）
+- **不切进代码围栏**（围栏内的 `##` 只是代码）；**首个标题之前的内容独立成第 0 片**（写入主页面）
+- 第 0 片 → 主页面；第 N 片 → 独立页，标题为 `<文档名> - <章节名>`，备注注明拆分来源
+- 分片页与主页面**共享同一个判重键**，所以去重是「数页数」：片齐才跳过，缺片会**自动补建**
+- 每片只上传本片用到的图片（不重复上传全量图）
+
+## 故障排查
+
+### 直接 `exit 2` 的四种情况
+
+| 输出 | 原因 | 处理 |
+|---|---|---|
+| `[FATAL] Notion 探活失败: 目标库不可访问 404` | 库 ID 错 / 库没共享给 Integration / 库已删 | 核对 `--db-id`；在 Notion 里把库连上 Integration |
+| `[FATAL] 条目清单变了…就加 --reset-cursor` | 重跑过 `build_entries.py`，清单顺序变了 | 确认清单无误后加 `--reset-cursor` |
+| `[FATAL] 本批 N 篇全部失败…疑似语雀风控` | cookie 过期 / 断网 | 重贴 cookie，稍后重跑（**游标已回滚到批首，不会漏篇**） |
+| `[FATAL] 条目文件不存在` / `没有结果可补` | 没先跑 `build_entries.py` / 补写时结果文件不存在 | 按提示先生成条目 / 先跑一轮迁移 |
+
+### 状态语义与谁来兜底
+
+| 状态 | 含义 | 谁来兜 |
+|---|---|---|
+| `OK` | 全部片正文写完（图片可能缺，记 `imgs=x/y`） | — |
+| `PARTIAL` | 页建了但正文没写全 | `--resume-write` |
+| `FAIL` / `RATE_LIMITED` | 抓取或建页失败 | 自动进重试队列 → `--mode retry-failed` |
+| `SKIP` | 垃圾文档（二进制/SQL dump/空）或 Notion 已存在 | — |
+
+### 常备动作
+
+```bash
+# 看这次要用哪个库、哪个知识库，值来自哪一层
+python3 scripts/batch_migrate.py --print-config
+
+# 半成品补写（按记录里的 page_id，不重建页）
+python3 scripts/batch_migrate.py --resume-write
+python3 scripts/batch_migrate.py --resume-write --only-images   # 只补图
+
+# 清重试队列
+python3 scripts/batch_migrate.py --mode retry-failed
+```
+
+## 测试
+
+184 项，**全离线**（假 `mcporter` + `sitecustomize` 拦掉网络与 sleep），不需要真库、不写任何数据：
+
+```bash
+python3 tests/test_settings.py      # 配置优先级 / fail-fast
+python3 tests/test_write_status.py  # 正文写失败判定 / 图片记账 / 补写
+python3 tests/test_cursor.py        # 游标推进 / 安全阀 / 每篇落盘 / 分桶 / 指纹
+python3 tests/test_split.py         # 拆分器：围栏 / 引言 / 深度 / 零丢失
+python3 tests/test_cards.py         # 卡片转换：math/hr/附件/未知类型
+python3 tests/test_bigdoc.py        # 大文档：缺片补建 / 每片只传本片图
+python3 tests/test_images.py        # 图片扩展名字节嗅探
+```
+
+每个脚本独立可跑，末尾输出 `通过 N / 失败 0`，失败时 exit 1。

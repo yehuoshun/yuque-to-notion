@@ -1,0 +1,9 @@
+# 第三方依赖（迁移工具本体）
+requests>=2.25
+
+# 外部命令依赖（不走 pip，需自行安装并在 PATH 里）：
+#   mcporter          —— MCP 客户端，用于调 yuque-mcp 抓取语雀文档
+#   yuque-mcp server  —— 语雀 MCP（Web API，需配 cookie + ctoken）
+#
+# Python 版本：>= 3.8（开发验证环境 3.14）
+# 测试：仅用标准库 + requests，见 README「测试」一节
