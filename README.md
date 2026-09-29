@@ -60,13 +60,17 @@ python3 scripts/batch_migrate.py --print-config  # 看当前实际生效值 + �
 | 参数 | 环境变量 | 说明 |
 |---|---|---|
 | `--db-id` / `--ds-id` | `NOTION_DATABASE_ID` / `NOTION_DATA_SOURCE_ID` | Notion 库 / data source |
+| `--dedup-property` | `NOTION_DEDUP_PROPERTY` | 去重判重字段（默认 `原文链接`，必须是 url 类型） |
 | `--book-id` / `--namespace` / `--user` | `YUQUE_BOOK_ID` / `YUQUE_NAMESPACE` / `YUQUE_USER` | 语雀知识库 |
+| `--mode` | — | `new` / `resume`（默认）/ `retry-failed` |
 | `--state-dir` | `YUQUE2NOTION_STATE_DIR` | 状态目录，默认 `<repo>/state/` |
+| `--entries` | — | 条目文件路径，默认 `<state-dir>/yuque_entries.json` |
 | `--env-file` | `OPENCLAW_CREDENTIALS` | 凭据文件，默认 `~/.openclaw/secrets/credentials.env` |
 | `--mcp-cwd` | `OPENCLAW_WORKSPACE` | mcporter 工作目录 |
 | `--batch-size` | `BATCH_SIZE` | 每批篇数 |
 | — | `MAX_CONTENT_CHARS` / `SPLIT_MIN_LEVEL` / `SPLIT_MAX_LEVEL` / `SPLIT_MIN_CHUNK` | 分片阈值与标题层级 |
 | `--dry-run` | — | 只探活 + 列批次，不写任何东西 |
+| `--print-config` | — | 打印生效配置（token 打码）后退出 |
 | `--reset-cursor` | — | 游标归零重扫（清单指纹变化时用） |
 | `--resume-write` / `--only-images` | — | 补写模式：按记录里的 page_id 补正文 / 只补图 |
 
