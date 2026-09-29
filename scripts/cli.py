@@ -161,23 +161,26 @@ def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
     mcp_cwd = os.path.expanduser(_pick('mcp_cwd', args.mcp_cwd, 'OPENCLAW_WORKSPACE',
                                        getattr(C, 'MCP_CWD', None), DEFAULT_MCP_CWD, src))
 
-    def cfg_int(name, attr, default):
-        v = _pick(name, None, None, getattr(C, attr, None), default, src)
+    def cfg_int(name, attr, default, env_key=None):
+        v = _pick(name, None, env_key, getattr(C, attr, None), default, src)
         try:
             return int(v)
         except (TypeError, ValueError):
             raise ConfigError(f'{name} 不是合法整数：{v!r}（来自 {src[name]}）')
 
-    batch_size = args.batch_size if args.batch_size is not None else cfg_int('batch_size', 'BATCH_SIZE', 10)
     if args.batch_size is not None:
+        batch_size = args.batch_size
         src['batch_size'] = '命令行'
-    max_content_chars = cfg_int('max_content_chars', 'MAX_CONTENT_CHARS', 50000)
-    split_min_level = cfg_int('split_min_level', 'SPLIT_MIN_LEVEL', 2)
-    split_max_level = cfg_int('split_max_level', 'SPLIT_MAX_LEVEL', 6)
-    split_min_chunk = cfg_int('split_min_chunk', 'SPLIT_MIN_CHUNK', 5120)
-    dedup_query_retries = cfg_int('dedup_query_retries', 'DEDUP_QUERY_RETRIES', 3)
+    else:
+        batch_size = cfg_int('batch_size', 'BATCH_SIZE', 10, 'BATCH_SIZE')
+    max_content_chars = cfg_int('max_content_chars', 'MAX_CONTENT_CHARS', 50000, 'MAX_CONTENT_CHARS')
+    split_min_level = cfg_int('split_min_level', 'SPLIT_MIN_LEVEL', 2, 'SPLIT_MIN_LEVEL')
+    split_max_level = cfg_int('split_max_level', 'SPLIT_MAX_LEVEL', 6, 'SPLIT_MAX_LEVEL')
+    split_min_chunk = cfg_int('split_min_chunk', 'SPLIT_MIN_CHUNK', 5120, 'SPLIT_MIN_CHUNK')
+    dedup_query_retries = cfg_int('dedup_query_retries', 'DEDUP_QUERY_RETRIES', 3, 'DEDUP_QUERY_RETRIES')
     dedup_max_consecutive_failures = cfg_int('dedup_max_consecutive_failures',
-                                            'DEDUP_MAX_CONSECUTIVE_FAILURES', 2)
+                                            'DEDUP_MAX_CONSECUTIVE_FAILURES', 2,
+                                            'DEDUP_MAX_CONSECUTIVE_FAILURES')
 
     entries_file = args.entries or os.path.join(state_dir, 'yuque_entries.json')
     src['entries_file'] = '命令行' if args.entries else 'state-dir 派生'

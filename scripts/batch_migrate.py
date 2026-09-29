@@ -100,12 +100,13 @@ IMG_RETRIES = 2        # 429/5xx 重试次数
 IMG_RETRY_WAIT = 1.5    # 重试基础等待（退避乘 2^n）
 IMG_THROTTLE = 0.2      # 每张间隔（秒）
 
-def notion_upload_images(image_srcs):
+def notion_upload_images(img_items):
     """原生上传 base64 图片到 Notion。
-    返回 (upload_map, failed_list)：failed 里每项是 '索引:阶段:原因'。"""
+    img_items: [(原图下标, src, link, ext), ...]（下标必须保留原值，因为占位 URL 用它命名）
+    返回 (upload_map, failed_list)：failed 里每项是 '下标:阶段:原因'。"""
     result = {}
     failed = []
-    for i, (src, link, ext) in enumerate(image_srcs):
+    for i, src, link, ext in img_items:
         if not src or not src.startswith('data:image/'):
             continue
         b64 = src.split(',', 1)[1] if ',' in src else src
@@ -297,23 +298,60 @@ def doc_body_precheck(result, entry):
 
 
 def check_notion_exists(yuque_url):
-    """查 Notion 是否有 判重字段=yuque_url 的记录。
-    True=已存在。查询失败一律抛 NotionInitError —— 绝不静默当成“不存在”。"""
+    """兼容旧接口：是否已经有同判重键的页。新逻辑请用 fetch_existing_pages（要数页数）。"""
+    return bool(fetch_existing_pages(yuque_url))
+
+
+def fetch_existing_pages(yuque_url):
+    """按判重键查出已存在的页，返回 [{'id':..,'title':..}, ...]。
+    分片天然共享同一判重键 → 返回的条数就是「已有片数」。
+    查询失败一律抛 NotionInitError —— 绝不静默当成“不存在”。"""
     ds_id = resolve_data_source_id()
-    body = {'filter': {'property': NOTION_DEDUP_PROPERTY, 'url': {'equals': yuque_url}},
-            'page_size': 1}
-    for attempt in range(DEDUP_QUERY_RETRIES):
-        r = requests.post(f'https://api.notion.com/v1/data_sources/{ds_id}/query',
-                          headers=NOTION_HEADERS, json=body, timeout=30)
-        if r.status_code == 200:
-            return len(r.json().get('results', [])) > 0
-        if r.status_code == 429 or r.status_code >= 500:
-            wait = 3 * (2 ** attempt)
-            print(f'    [notion] 去重查询 {r.status_code}，{wait}s 后重试 ({attempt+1}/{DEDUP_QUERY_RETRIES})')
-            time.sleep(wait)
-            continue
-        raise NotionInitError(f'去重查询失败 {r.status_code}: {r.text[:200]}')
-    raise NotionInitError(f'去重查询连续失败 {DEDUP_QUERY_RETRIES} 次（限流/5xx）')
+    out, cursor = [], None
+    for _ in range(20):   # 最多 20 页（正常分片远少于 100）
+        body = {'filter': {'property': NOTION_DEDUP_PROPERTY, 'url': {'equals': yuque_url}},
+                'page_size': 100}
+        if cursor:
+            body['start_cursor'] = cursor
+        for attempt in range(DEDUP_QUERY_RETRIES):
+            r = requests.post(f'https://api.notion.com/v1/data_sources/{ds_id}/query',
+                              headers=NOTION_HEADERS, json=body, timeout=30)
+            if r.status_code == 200:
+                break
+            if r.status_code == 429 or r.status_code >= 500:
+                wait = 3 * (2 ** attempt)
+                print(f'    [notion] 去重查询 {r.status_code}，{wait}s 后重试 ({attempt+1}/{DEDUP_QUERY_RETRIES})')
+                time.sleep(wait)
+                continue
+            raise NotionInitError(f'去重查询失败 {r.status_code}: {r.text[:200]}')
+        else:
+            raise NotionInitError(f'去重查询连续失败 {DEDUP_QUERY_RETRIES} 次（限流/5xx）')
+        data = r.json()
+        for pg in data.get('results', []):
+            props = pg.get('properties') or {}
+            t = ''
+            for v in props.values():
+                if v.get('type') == 'title':
+                    t = ''.join(x.get('plain_text', '') for x in v.get('title') or [])
+                    break
+            out.append({'id': pg.get('id'), 'title': t})
+        if not data.get('has_more'):
+            break
+        cursor = data.get('next_cursor')
+    return out
+
+
+def chunk_page_title(doc_title, ci, chapter_title):
+    """分片页标题（建页和后续匹配必须用同一个规则）"""
+    if ci == 0:
+        return doc_title[:2000]
+    return f'{doc_title[:60]} - {(chapter_title or "")[:80]}'
+
+
+def images_for_chunk(chunk_markdown, img_list):
+    """本片用到的图片子集（按片内 n2m.local/img_N 占位取），保留原下标"""
+    idxs = {int(m) for m in re.findall(r'n2m\.local/img_(\d+)\.', chunk_markdown or '')}
+    return [(i, s, l, e) for i, (s, l, e) in enumerate(img_list or []) if i in idxs]
 
 
 # ── 标题/围栏识别 ──
@@ -464,12 +502,14 @@ def _split_oversize(content, threshold):
     return [p for p in parts if p] or [content]
 
 
-def write_markdown_and_images(page_id, markdown_slice, img_list, tag_str, skip_markdown=False):
+def write_markdown_and_images(page_id, markdown_slice, img_items, tag_str, skip_markdown=False):
     """写 markdown + 图片。
+    img_items: [(原图下标, src, link, ext), ...]（分片时只传本片用到的图）
     返回 (ok: bool, detail: str, imgs_ok: int, imgs_total: int)
     ok=False 代表 markdown 没完整写入（失败或被截断）；图片缺失不算，记 detail。"""
     flags = []
-    base64_total = sum(1 for src, _, _ in img_list if src and src.startswith('data:image/'))
+    img_items = img_items or []
+    base64_total = sum(1 for _, src, _, _ in img_items if src and src.startswith('data:image/'))
     if not skip_markdown:
         if not markdown_slice:
             return True, 'ok(空)', 0, base64_total
@@ -485,7 +525,7 @@ def write_markdown_and_images(page_id, markdown_slice, img_list, tag_str, skip_m
     if base64_total == 0:
         detail = '; '.join(['ok'] + flags) if flags else 'ok'
         return (not flags), detail, 0, 0
-    upload_map, up_fail = notion_upload_images(img_list)
+    upload_map, up_fail = notion_upload_images(img_items)
     attached, at_fail = notion_attach_images(page_id, upload_map, markdown_slice)
     detail = f'imgs={attached}/{base64_total}'
     n_fail = len(up_fail) + len(at_fail)
@@ -494,6 +534,27 @@ def write_markdown_and_images(page_id, markdown_slice, img_list, tag_str, skip_m
     if flags:
         detail += '; ' + '; '.join(flags)
     return (not flags), detail, attached, base64_total
+
+
+def create_chunk_page(entry, result, ci, chapter_title, tag_str, yuque_url):
+    """补建分片页（resume-write 用）：主页面或子页面。返回 page_id 或 None"""
+    title = chunk_page_title(entry.get('title', ''), ci, chapter_title)
+    tags = extract_tags(entry.get('title', ''), result.get('body', ''),
+                        entry.get('source', '其他'), entry.get('category', '其他'))
+    props = {
+        '名称': {'title': [{'text': {'content': title[:2000]}}]},
+        '来源': {'select': {'name': entry.get('source', '其他')}},
+        '分类': {'select': {'name': entry.get('category', '其他')}},
+        '字数': {'number': result.get('word_count', 0)},
+        '标签': {'multi_select': [{'name': t} for t in tags[:15]]},
+        '原文链接': {'url': yuque_url},
+    }
+    if ci > 0:
+        note = (f"从语雀「{YUQUE_NAMESPACE}」中的「{entry.get('title', '')}」拆分而来，"
+                f"此为第{ci+1}章「{chapter_title}」")
+        props['备注'] = {'rich_text': [{'text': {'content': note[:2000]}}]}
+    page = create_notion_page(props)
+    return (page or {}).get('id')
 
 
 def repair_pages(records, entries):
@@ -521,6 +582,9 @@ def repair_pages(records, entries):
         markdown, img_list = lake_to_markdown(result.get('body', ''))
         chunks = split_markdown_by_headings(markdown)
         page_ids = rec.get('page_ids') or {}
+        tag_str = '/'.join(extract_tags(e.get('title', ''), result.get('body', ''),
+                                        e.get('source', '其他'), e.get('category', '其他'))[:6])
+        yuque_url = f'https://www.yuque.com/{YUQUE_USER}/{YUQUE_NAMESPACE}/{result.get("slug", "")}'
         chunks_ok = 0
         imgs_ok_sum = 0
         imgs_total = 0
@@ -528,12 +592,18 @@ def repair_pages(records, entries):
         for ci, (ct, c) in enumerate(chunks):
             pid = page_ids.get(str(ci)) or page_ids.get(ci)
             if not pid:
-                notes.append(f'chunk{ci}:无page_id')
-                continue
+                # 缺 page_id（上次连页都没建成）→ 补建，别丢片
+                pid = create_chunk_page(e, result, ci, ct, tag_str, yuque_url)
+                if not pid:
+                    notes.append(f'chunk{ci}:补建页失败')
+                    continue
+                page_ids[str(ci)] = pid
+                print(f'    [repair] 补建了第 {ci+1} 片页: {pid}')
+            chunk_imgs = images_for_chunk(c, img_list)
             okw, detail, io, it = write_markdown_and_images(
-                pid, c, img_list, tag_str='', skip_markdown=S.only_images)
+                pid, c, chunk_imgs, tag_str=tag_str, skip_markdown=S.only_images)
             imgs_ok_sum += io
-            imgs_total = max(imgs_total, it)
+            imgs_total += it
             if okw:
                 chunks_ok += 1
             else:
@@ -828,9 +898,13 @@ for i, entry in enumerate(batch):
     if url:
         props['备注'] = {'rich_text': [{'text': {'content': f'原文出处: {url}'}}]}
 
-    # ───── 去重：Notion 侧（fail-fast，查询失败不当“不存在”）─────
+    # ───── 拆分 Big Doc（先去重前算出来，因为要按片数对账）─────
+    chunks = split_markdown_by_headings(markdown)
+    expected_titles = [chunk_page_title(entry['title'], ci, t) for ci, (t, _c) in enumerate(chunks)]
+
+    # ───── 去重：Notion 侧（数页数 + 按标题映射分片；查询失败不当“不存在”）─────
     try:
-        notion_exists = check_notion_exists(yuque_url)
+        existing_pages = fetch_existing_pages(yuque_url)
     except NotionInitError as e:
         dedup_fail_streak += 1
         print(f"  [{idx}] FAIL: 去重查询异常 - {e}")
@@ -845,30 +919,39 @@ for i, entry in enumerate(batch):
         continue
     dedup_fail_streak = 0
 
-    if notion_exists:
-        print(f"  [{idx}] SKIP（Notion 已存在）- {entry['title'][:50]}")
+    by_title = {}
+    for p in existing_pages:
+        by_title.setdefault(p.get('title', ''), p.get('id'))
+    found_pages = [by_title.get(t) for t in expected_titles]
+
+    if all(found_pages):
+        print(f"  [{idx}] SKIP（Notion 已存在 {len(existing_pages)} 页）- {entry['title'][:50]}")
         entry_result = {'idx': idx, 'status': 'SKIP', 'title': entry['title'][:50],
-                        'doc_id': doc_id, 'reason': 'notion_exists'}
+                        'doc_id': doc_id, 'reason': 'notion_exists',
+                        'page_ids': {str(ci): pid for ci, pid in enumerate(found_pages) if pid}}
         results.append(entry_result)
         save_result(entry_result, idx)
         continue
 
-    # ───── 拆分 Big Doc ─────
-    chunks = split_markdown_by_headings(markdown)
+    reuse = any(found_pages)   # 部分在 → 补建缺片（已存在的页也会重写一次正文，顺手修好坏片）
+    if reuse:
+        print(f"  [{idx}] 补建缺片：Notion 已有 {sum(1 for x in found_pages if x)}/{len(chunks)} 页")
 
-    # 创建主页面
-    page = create_notion_page(props)
-    if not page or not page.get('id'):
-        print(f"  [{idx}] FAIL: 创建页失败 - {entry['title'][:50]}")
-        entry_result = {'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50],
-                        'doc_id': doc_id, 'reason': 'create_page_failed'}
-        results.append(entry_result)
-        save_result(entry_result, idx)
-        continue
-    main_page_id = page['id']
+    # 主页面：能复用就复用，否则新建
+    main_page_id = found_pages[0]
+    if not main_page_id:
+        page = create_notion_page(props)
+        if not page or not page.get('id'):
+            print(f"  [{idx}] FAIL: 创建页失败 - {entry['title'][:50]}")
+            entry_result = {'idx': idx, 'status': 'FAIL', 'title': entry['title'][:50],
+                            'doc_id': doc_id, 'reason': 'create_page_failed'}
+            results.append(entry_result)
+            save_result(entry_result, idx)
+            continue
+        main_page_id = page['id']
 
     page_ids = {'0': main_page_id}  # chunk 下标 -> page_id
-    pages_created = 1
+    pages_created = 1 if not found_pages[0] else 0
     chunks_ok = 0
     chunks_total = len(chunks)
     imgs_ok_total = 0
@@ -877,42 +960,48 @@ for i, entry in enumerate(batch):
     split_notes = []
 
     for ci, (chapter_title, chapter_content) in enumerate(chunks):
-        if ci == 0:
-            target_page = main_page_id
-        else:
-            # 第 N 章 → 创建独立页面
-            child_title = f"{entry['title'][:60]} - {chapter_title}"
-            child_props = {
-                '名称': {'title': [{'text': {'content': child_title[:2000]}}]},
-                '来源': {'select': {'name': entry['source']}},
-                '分类': {'select': {'name': entry['category']}},
-                '字数': {'number': result.get('word_count', 0)},
-                '标签': {'multi_select': [{'name': t} for t in tags[:15]]},
-                '原文链接': {'url': yuque_url}
-            }
-            # 备注：父文档来源
-            child_note = f"从语雀「{YUQUE_NAMESPACE}」中的「{entry['title']}」拆分而来，此为第{ci+1}章「{chapter_title}」"
-            child_props['备注'] = {'rich_text': [{'text': {'content': child_note[:2000]}}]}
+        target_page = found_pages[ci]
+        if not target_page:
+            if ci == 0:
+                target_page = main_page_id
+            else:
+                # 缺失片 → 建新页
+                child_title = expected_titles[ci]
+                child_props = {
+                    '名称': {'title': [{'text': {'content': child_title[:2000]}}]},
+                    '来源': {'select': {'name': entry['source']}},
+                    '分类': {'select': {'name': entry['category']}},
+                    '字数': {'number': result.get('word_count', 0)},
+                    '标签': {'multi_select': [{'name': t} for t in tags[:15]]},
+                    '原文链接': {'url': yuque_url}
+                }
+                # 备注：父文档来源
+                child_note = f"从语雀「{YUQUE_NAMESPACE}」中的「{entry['title']}」拆分而来，此为第{ci+1}章「{chapter_title}」"
+                child_props['备注'] = {'rich_text': [{'text': {'content': child_note[:2000]}}]}
 
-            child_page = create_notion_page(child_props)
-            if not child_page or not child_page.get('id'):
-                problems.append(f'chunk{ci}:子页创建失败:{chapter_title[:20]}')
-                split_notes.append(f"❌{chapter_title[:40]}(创建失败)")
-                continue
-            target_page = child_page['id']
-            page_ids[str(ci)] = target_page
-            pages_created += 1
-            split_notes.append(chapter_title[:50])
-            time.sleep(5)  # 子页面间稍等防止限流
+                child_page = create_notion_page(child_props)
+                if not child_page or not child_page.get('id'):
+                    problems.append(f'chunk{ci}:子页创建失败:{str(chapter_title)[:20]}')
+                    split_notes.append(f"❌{str(chapter_title)[:40]}(创建失败)")
+                    continue
+                target_page = child_page['id']
+                pages_created += 1
+                time.sleep(5)  # 子页面间稍等防限流
 
-        okw, detail, io, it = write_markdown_and_images(target_page, chapter_content, img_list, tag_str)
+        page_ids[str(ci)] = target_page
+        if ci > 0:
+            split_notes.append(str(chapter_title)[:50])
+
+        # 每片只传本片用到的图（原来每片都全量重传，336 图的文档要白传一倍）
+        chunk_imgs = images_for_chunk(chapter_content, img_list)
+        okw, detail, io, it = write_markdown_and_images(target_page, chapter_content, chunk_imgs, tag_str)
         imgs_ok_total += io
-        imgs_total_total = max(imgs_total_total, it)
+        imgs_total_total += it
         if okw:
             chunks_ok += 1
         else:
             problems.append(f'chunk{ci}:{detail}')
-            split_notes.append(f"❌{chapter_title[:40]}(正文写失败)")
+            split_notes.append(f"❌{str(chapter_title)[:40]}(正文写失败)")
 
     # ───── 状态判定 ─────
     status = 'OK' if (chunks_ok == chunks_total and not problems) else 'PARTIAL'

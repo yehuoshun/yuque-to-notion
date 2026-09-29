@@ -70,7 +70,8 @@ def png_b64():
 
 
 def img_list(n):
-    return [(f'data:image/png;base64,{png_b64()}', None, 'png') for _ in range(n)]
+    """带原下标的图片清单（新签名：[(下标, src, link, ext)]）"""
+    return [(i, f'data:image/png;base64,{png_b64()}', None, 'png') for i in range(n)]
 
 
 def install(fake, markdown_status=200, upload_ok=True, attach_ok=True, block_urls=None):
@@ -148,7 +149,10 @@ fake = install(FakeReq(), markdown_status=200,
                block_urls=['https://n2m.local/img_0.png'])
 ns['requests'] = fake
 created = []
-ns['create_notion_page'] = lambda props: (_ for _ in ()).throw(AssertionError('repair 不该建页'))
+def _fake_create(props):
+    created.append(props)
+    return {'id': 'page-created-%d' % len(created)}
+ns['create_notion_page'] = _fake_create
 ns['fetch_doc_with_retry'] = lambda entry, book_id: ({'body': '<h2>第一章标题</h2><p>第一章正文</p>\n\n<h2>第二章标题</h2><p>第二章正文</p>', 'word_count': 9, 'slug': 's'}, None)
 saved = []
 ns['save_result'] = saved.append
@@ -156,7 +160,7 @@ rec = {'idx': 3, 'status': 'PARTIAL', 'doc_id': '777', 'title': 'T',
        'page_ids': {'0': 'page-main', '1': 'page-child'}, 'imgs_ok': 0, 'imgs_total': 0}
 rc = ns['repair_pages']([rec], [{'doc_id': '777', 'title': 'T', 'source': '其他', 'category': '其他'}])
 check('repair 返回 0（正常结束）', rc == 0, str(rc))
-check('没有调用建页', True, 'create_notion_page 被 stub 为抛错，没炸即没调')
+check('已有 page_id → 不重复建页', created == [], f'creates={len(created)}')
 check('补写结果落盘为 OK', saved and saved[-1]['status'] == 'OK', str(saved[-1]['status']) if saved else '无')
 check('page_ids 保留', saved and saved[-1]['page_ids'] == {'0': 'page-main', '1': 'page-child'}, '')
 calls = fake.calls
@@ -183,6 +187,9 @@ check('only_images 不调用 markdown PATCH', not patch_pages2, str(patch_pages2
 uploads = [u for m, u, _ in fake2.calls if m == 'POST' and 'file_uploads' in u]
 check('only_images 仍上传图片', len(uploads) >= 1, str(len(uploads)))
 check('only_images 结果 imgs_ok 记账', saved2 and saved2[-1]['imgs_ok'] == 1, '')
+check('缺 page_id 的片会补建（不再放弃）', len(created) >= 1, f'creates={len(created)}')
+check('补建后 page_ids 写全', saved2 and len(saved2[-1]['page_ids']) == saved2[-1]['chunks_total'],
+      str(saved2[-1]['page_ids'] if saved2 else None))
 
 print('\n== F. cli 接线 ==')
 from cli import load_settings  # noqa: E402
