@@ -5,6 +5,8 @@
 用法：python3 tests/test_settings.py
 """
 import os
+import re
+import subprocess
 import sys
 import tempfile
 
@@ -159,6 +161,26 @@ def main():
     finally:
         os.unlink(p)
         clean_env()
+
+    print('\n== 8. 各脚本只列自己的开关（--help 不再误导） ==')
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env2 = dict(os.environ)
+    env2['YUQUE2NOTION_STATE_DIR'] = tempfile.mkdtemp(prefix='y2n-help-')
+
+    def help_flags(script):
+        r = subprocess.run([sys.executable, os.path.join(repo, 'scripts', script), '--help'],
+                           capture_output=True, text=True, cwd=repo, env=env2)
+        return set(re.findall(r'(--[a-z][a-z0-9-]+)', r.stdout)), r.returncode
+
+    bf, brc = help_flags('build_entries.py')
+    check('build_entries 只列相关开关', brc == 0 and '--book-id' in bf and '--resume-write' not in bf
+          and '--db-id' not in bf and '--mode' not in bf, f'rc={brc} flags={sorted(bf)}')
+    lf, lrc = help_flags('lake_convert.py')
+    check('lake_convert 只列相关开关', lrc == 0 and '--book-id' in lf and '--only-images' not in lf,
+          f'rc={lrc} flags={sorted(lf)}')
+    mf, mrc = help_flags('batch_migrate.py')
+    check('batch_migrate 全量开关齐全', mrc == 0 and {'--db-id', '--resume-write', '--mode', '--dry-run'} <= mf,
+          f'rc={mrc} n={len(mf)}')
 
     print(f'\n{"=" * 52}\n通过 {len(PASS)} / 失败 {len(FAIL)}')
     for f in FAIL:

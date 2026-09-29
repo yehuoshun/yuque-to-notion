@@ -52,39 +52,91 @@ class Settings:
     sources: dict  # 字段 -> 生效来源，供 --print-config 用
 
 
+# 每个脚本真正用得上的开关（不再一股脑全列出来，免得 --help 误导）
+_SCRIPT_FLAGS = {
+    'batch_migrate': ('mode', 'db_id', 'ds_id', 'dedup_property', 'book_id', 'namespace', 'user',
+                      'batch_size', 'state_dir', 'entries', 'env_file', 'mcp_cwd', 'dry_run',
+                      'resume_write', 'only_images', 'reset_cursor', 'print_config'),
+    'build_entries': ('book_id', 'namespace', 'user', 'state_dir', 'entries',
+                      'env_file', 'mcp_cwd', 'print_config'),
+    'lake_convert': ('book_id', 'namespace', 'user', 'state_dir', 'entries',
+                     'env_file', 'mcp_cwd', 'print_config'),
+}
+
+
+_SCRIPT_DESC = {
+    'batch_migrate': '语雀 → Notion 迁移（优先级：命令行 > 环境变量 > config.py 默认值）',
+    'build_entries': '拉语雀知识库目录 → 生成条目清单（供 batch_migrate 用）',
+    'lake_convert': '语雀 lake 文档 → Markdown 转换（单篇调试用）',
+}
+
+
 def build_parser(prog='batch_migrate'):
-    p = argparse.ArgumentParser(
-        prog=prog,
-        description='语雀 → Notion 迁移工具（优先级：命令行 > 环境变量 > config.py 默认值）')
+    allowed = _SCRIPT_FLAGS.get(prog, _SCRIPT_FLAGS['batch_migrate'])
+    on = lambda *names: any(n in allowed for n in names)   # noqa: E731
+
+    p = argparse.ArgumentParser(prog=prog, description=_SCRIPT_DESC.get(prog, _SCRIPT_DESC['batch_migrate']))
     # 兼容旧用法：python3 batch_migrate.py new
-    p.add_argument('legacy_mode', nargs='?', choices=['new', 'resume', 'retry-failed'],
-                   default=None, help=argparse.SUPPRESS)
-    p.add_argument('--mode', choices=['new', 'resume', 'retry-failed'],
-                   help='运行模式（默认 resume）')
-    p.add_argument('--db-id', dest='db_id', help='Notion 库 ID')
-    p.add_argument('--ds-id', dest='ds_id', help='Notion data source ID（库下多源时必填）')
-    p.add_argument('--dedup-property', dest='dedup_property', help='去重判重字段（url 类型）')
-    p.add_argument('--book-id', dest='book_id', help='语雀知识库 ID')
-    p.add_argument('--namespace', help='语雀知识库 slug（拼原文链接用）')
-    p.add_argument('--user', help='语雀用户名（拼原文链接用）')
-    p.add_argument('--batch-size', dest='batch_size', type=int, help='每批篇数')
-    p.add_argument('--state-dir', dest='state_dir', help=f'状态目录（默认 {DEFAULT_STATE_DIR}）')
-    p.add_argument('--entries', help='条目文件（默认 <state-dir>/yuque_entries.json）')
-    p.add_argument('--env-file', dest='env_file',
-                   help=f'凭据文件（默认 {DEFAULT_ENV_FILE}）')
-    p.add_argument('--mcp-cwd', dest='mcp_cwd',
-                   help=f'mcporter 工作目录（默认 {DEFAULT_MCP_CWD}）')
-    p.add_argument('--dry-run', dest='dry_run', action='store_true',
-                   help='只探活 + 列批次，不写任何东西')
-    p.add_argument('--resume-write', dest='resume_write', action='store_true',
-                   help='补写模式：只往上次结果里已存在的页补正文（PARTIAL 记录），不建页、不推进度')
-    p.add_argument('--only-images', dest='only_images', action='store_true',
-                   help='配合 --resume-write：只补图片，不重写正文（用于 imgs 缺失的记录）')
-    p.add_argument('--reset-cursor', dest='reset_cursor', action='store_true',
-                   help='把本任务的游标归零重扫（清单指纹变化时需显式指定）')
-    p.add_argument('--print-config', dest='print_config', action='store_true',
-                   help='打印生效配置（token 打码）后退出')
+    if 'mode' in allowed:
+        p.add_argument('legacy_mode', nargs='?', choices=['new', 'resume', 'retry-failed'],
+                       default=None, help=argparse.SUPPRESS)
+        p.add_argument('--mode', choices=['new', 'resume', 'retry-failed'],
+                       help='运行模式（默认 resume）')
+    if on('db_id'):
+        p.add_argument('--db-id', dest='db_id', help='Notion 库 ID')
+    if on('ds_id'):
+        p.add_argument('--ds-id', dest='ds_id', help='Notion data source ID（库下多源时必填）')
+    if on('dedup_property'):
+        p.add_argument('--dedup-property', dest='dedup_property', help='去重判重字段（url 类型）')
+    if on('book_id'):
+        p.add_argument('--book-id', dest='book_id', help='语雀知识库 ID')
+    if on('namespace'):
+        p.add_argument('--namespace', help='语雀知识库 slug（拼原文链接用）')
+    if on('user'):
+        p.add_argument('--user', help='语雀用户名（拼原文链接用）')
+    if on('batch_size'):
+        p.add_argument('--batch-size', dest='batch_size', type=int, help='每批篇数')
+    if on('state_dir'):
+        p.add_argument('--state-dir', dest='state_dir', help=f'状态目录（默认 {DEFAULT_STATE_DIR}）')
+    if on('entries'):
+        p.add_argument('--entries', help='条目文件（默认 <state-dir>/yuque_entries.json）')
+    if on('env_file'):
+        p.add_argument('--env-file', dest='env_file', help=f'凭据文件（默认 {DEFAULT_ENV_FILE}）')
+    if on('mcp_cwd'):
+        p.add_argument('--mcp-cwd', dest='mcp_cwd',
+                       help=f'mcporter 工作目录（默认 {DEFAULT_MCP_CWD}）')
+    if on('dry_run'):
+        p.add_argument('--dry-run', dest='dry_run', action='store_true',
+                       help='只探活 + 列批次，不写任何东西')
+    if on('resume_write'):
+        p.add_argument('--resume-write', dest='resume_write', action='store_true',
+                       help='补写模式：只往上次结果里已存在的页补正文（PARTIAL 记录），不建页、不推进度')
+    if on('only_images'):
+        p.add_argument('--only-images', dest='only_images', action='store_true',
+                       help='配合 --resume-write：只补图片，不重写正文（用于 imgs 缺失的记录）')
+    if on('reset_cursor'):
+        p.add_argument('--reset-cursor', dest='reset_cursor', action='store_true',
+                       help='把本任务的游标归零重扫（清单指纹变化时需显式指定）')
+    if on('print_config'):
+        p.add_argument('--print-config', dest='print_config', action='store_true',
+                       help='打印生效配置（token 打码）后退出')
     return p
+
+
+# parse_args 后把本脚本没定义的开关补上默认值（load_settings 统一按全量字段读）
+_ARG_DEFAULTS = {
+    'legacy_mode': None, 'mode': None, 'db_id': None, 'ds_id': None, 'dedup_property': None,
+    'book_id': None, 'namespace': None, 'user': None, 'batch_size': None, 'state_dir': None,
+    'entries': None, 'env_file': None, 'mcp_cwd': None, 'dry_run': False, 'resume_write': False,
+    'only_images': False, 'reset_cursor': False, 'print_config': False,
+}
+
+
+def _fill_defaults(args):
+    for k, v in _ARG_DEFAULTS.items():
+        if not hasattr(args, k):
+            setattr(args, k, v)
+    return args
 
 
 def read_env_file(path):
@@ -142,7 +194,7 @@ def _mask(secret):
 
 def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
     """解析并校验配置。argv=None 时取 sys.argv[1:]。"""
-    args = build_parser(prog).parse_args(argv)
+    args = _fill_defaults(build_parser(prog).parse_args(argv))
     import config as C  # 只提供默认值，不含逻辑
 
     src = {}
@@ -224,39 +276,53 @@ def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
         notion_token=notion_token, sources=src)
 
     if args.print_config:
-        print_config(s)
+        print_config(s, prog)
         sys.exit(0)
     return s
 
 
-def print_config(s):
+def print_config(s, prog='batch_migrate'):
     src = s.sources
     rows = [
-        ('mode', s.mode, 'mode'),
-        ('notion_db_id', s.notion_db_id, 'notion_db_id'),
-        ('notion_ds_id', s.notion_ds_id or '(自动解析)', 'notion_ds_id'),
-        ('dedup_property', s.dedup_property, 'dedup_property'),
-        ('yuque_book_id', s.book_id, 'book_id'),
-        ('namespace', s.namespace, 'namespace'),
-        ('user', s.user, 'user'),
-        ('batch_size', s.batch_size, 'batch_size'),
-        ('max_content_chars', s.max_content_chars, 'max_content_chars'),
-        ('split_levels', f'{s.split_min_level}-{s.split_max_level} h级', 'split_min_level'),
-        ('split_min_chunk', s.split_min_chunk, 'split_min_chunk'),
-        ('state_dir', s.state_dir, 'state_dir'),
-        ('entries_file', s.entries_file, 'entries_file'),
-        ('progress_file', s.progress_file, 'progress_file'),
-        ('prev_results_file', s.prev_results_file, 'prev_results_file'),
-        ('env_file', s.env_file, 'env_file'),
-        ('mcp_cwd', s.mcp_cwd, 'mcp_cwd'),
-        ('dry_run', s.dry_run, 'dry_run'),
-        ('resume_write', s.resume_write, 'resume_write'),
-        ('only_images', s.only_images, 'only_images'),
-        ('reset_cursor', s.reset_cursor, 'reset_cursor'),
-        ('NOTION_TOKEN', _mask(s.notion_token), 'notion_token'),
+        ('mode', s.mode, 'mode', 'run'),
+        ('notion_db_id', s.notion_db_id, 'notion_db_id', 'notion'),
+        ('notion_ds_id', s.notion_ds_id or '(自动解析)', 'notion_ds_id', 'notion'),
+        ('dedup_property', s.dedup_property, 'dedup_property', 'notion'),
+        ('yuque_book_id', s.book_id, 'book_id', 'book'),
+        ('namespace', s.namespace, 'namespace', 'book'),
+        ('user', s.user, 'user', 'book'),
+        ('batch_size', s.batch_size, 'batch_size', 'run'),
+        ('max_content_chars', s.max_content_chars, 'max_content_chars', 'run'),
+        ('split_levels', f'{s.split_min_level}-{s.split_max_level} h级', 'split_min_level', 'run'),
+        ('split_min_chunk', s.split_min_chunk, 'split_min_chunk', 'run'),
+        ('state_dir', s.state_dir, 'state_dir', 'path'),
+        ('entries_file', s.entries_file, 'entries_file', 'path'),
+        ('progress_file', s.progress_file, 'progress_file', 'cursor'),
+        ('prev_results_file', s.prev_results_file, 'prev_results_file', 'cursor'),
+        ('env_file', s.env_file, 'env_file', 'path'),
+        ('mcp_cwd', s.mcp_cwd, 'mcp_cwd', 'path'),
+        ('dry_run', s.dry_run, 'dry_run', 'run'),
+        ('resume_write', s.resume_write, 'resume_write', 'run'),
+        ('only_images', s.only_images, 'only_images', 'run'),
+        ('reset_cursor', s.reset_cursor, 'reset_cursor', 'run'),
+        ('NOTION_TOKEN', _mask(s.notion_token), 'notion_token', 'token'),
     ]
+    allowed = _SCRIPT_FLAGS.get(prog, _SCRIPT_FLAGS['batch_migrate'])
+    # 每类配置保留条件：本脚本用得到的才打（path 类全保留；token 只在需要 Notion 时打）
+    def keep(group):
+        if group == 'path':
+            return True
+        if group == 'notion' or group == 'token':
+            return 'db_id' in allowed
+        if group == 'book':
+            return 'book_id' in allowed
+        # run / cursor：只有跑批的脚本才用得到
+        return 'mode' in allowed
+
     print('生效配置（命令行 > 环境变量 > config.py）')
-    for k, v, skey in rows:
+    for k, v, skey, group in rows:
+        if not keep(group):
+            continue
         print(f'  {k:24s} = {str(v):52s} [{src.get(skey, "-")}]')
 
 
