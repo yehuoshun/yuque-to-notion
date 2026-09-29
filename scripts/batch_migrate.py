@@ -1,6 +1,6 @@
 import base64, subprocess, json, urllib.parse, re, time, sys, os
 import requests
-from lake_convert import lake_to_markdown
+from lake_convert import lake_to_markdown, count_unsupported_cards
 from cli import load_settings, ConfigError, ensure_state_dir
 import state_store as st
 
@@ -808,6 +808,7 @@ for i, entry in enumerate(batch):
 
     # ───── lake → markdown ─────
     markdown, img_list = lake_to_markdown(body)
+    unsupported = count_unsupported_cards(markdown)
     url = extract_url(body, entry['source'])
     tags = extract_tags(entry['title'], body, entry['source'], entry['category'])
 
@@ -926,6 +927,8 @@ for i, entry in enumerate(batch):
         print(f"        ⚠ {detail}")
 
     print(f"        原文链接: {yuque_url}")
+    if unsupported:
+        print(f"        ⚠ 未转换卡片: " + ', '.join(f'{k}×{v}' for k, v in unsupported.items()))
     if url:
         print(f"        备注: 原文出处: {url}")
 
@@ -934,6 +937,7 @@ for i, entry in enumerate(batch):
                     'page_ids': page_ids,
                     'chunks_ok': chunks_ok, 'chunks_total': chunks_total,
                     'imgs_ok': imgs_ok_total, 'imgs_total': imgs_total_total,
+                    'unsupported_cards': unsupported,
                     'detail': detail}
     results.append(entry_result)
     save_result(entry_result, idx)

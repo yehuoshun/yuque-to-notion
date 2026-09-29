@@ -107,3 +107,18 @@ python3 scripts/batch_migrate.py --mode retry-failed
 - 标签上限 15 个
 - 配置或目标库有问题时**直接报错退出**（`exit 2`），不会静默跑错库
 - 状态结果：`OK`（完成）/ `PARTIAL`（页建了但正文没写全）/ `FAIL` / `RATE_LIMITED` / `SKIP`（垃圾或已迁）
+
+### 语雀卡片转换
+
+| 卡片 | 转换结果 |
+|---|---|
+| `codeblock` | 围栏代码块（保留语言） |
+| `image` | 原生上传到 Notion；base64 图走 file_upload |
+| `math` | 含 LaTeX 特征（`\frac`/`^`/`_`…）→ `$…$` / `$$…$$`；否则当行内代码（语雀 math 卡片也会装普通代码） |
+| `hr` | `---` |
+| `file` / 附件 | `📎 [文件名](url)` |
+| `bookmark` / 链接 | `[标题](url)` |
+| `video` / `audio` | `[视频](url)` |
+| 表格 / 画板 / 思维导图 / **未知类型** | 可见占位 `> ⚠️ 未转换的语雀卡片：xxx（请回原文查看）`，并在结果里记 `unsupported_cards` |
+
+**任何卡片都不会被静默丢掉**：不认识的类型一律落成可见占位 + 记账。

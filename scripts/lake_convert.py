@@ -11,6 +11,47 @@ def decode_card_value(raw_val):
     except Exception:
         return None
 
+
+# ── 卡片识别 ──
+NAME_RE = re.compile(r'name="([^"]*)"', re.I)
+VALUE_RE = re.compile(r'value="([^"]*)"', re.I)
+TYPE_RE = re.compile(r'type="([^"]*)"', re.I)
+# 任意 card 标签（含自闭合/无 value 的）
+CARD_ANY_RE = re.compile(r'<card\b[^>]*>(?:\s*</card>)?', re.I | re.S)
+# 公式特征：真正 LaTeX 才当公式，否则当行内代码（实测语雀 math 卡片也会装普通代码）
+LATEX_HINT_RE = re.compile(r'\\[a-zA-Z]{2,}|\^\s*\{|_\s*\{|\\frac|\\sum|\\int|\\sqrt|\\begin\{')
+UNSUPPORTED_MARK = '未转换的语雀卡片'
+
+
+def _card_name(tag):
+    m = NAME_RE.search(tag or '')
+    return (m.group(1).lower() if m else 'unknown')
+
+
+def _looks_latex(code):
+    return bool(LATEX_HINT_RE.search(code or ''))
+
+
+def _unescape(text):
+    """HTML 实体还原（代码/公式内容也需要，否则会留下 &quot; &amp;）"""
+    if text is None:
+        return ''
+    return (text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                .replace('&nbsp;', ' ').replace('&quot;', '"').replace('&#39;', "'")
+                .replace('\u200b', '').replace('\xa0', ' '))
+
+
+def card_placeholder(name, hint=''):
+    """未支持/降级卡片的可见占位（绝不静默丢掉）"""
+    extra = f'（{hint}）' if hint else ''
+    return f'\n> ⚠️ {UNSUPPORTED_MARK}：{name or "unknown"}{extra}（请回原文查看）\n'
+
+
+def count_unsupported_cards(markdown):
+    """统计正文里未转换的卡片类型及数量，供 batch_migrate 记账"""
+    from collections import Counter
+    return dict(Counter(re.findall(rf'{UNSUPPORTED_MARK}：([a-zA-Z_\-]+)', markdown or '')))
+
 LANG_MAP = {'markdown': 'markdown', 'md': 'markdown', 'css': 'css',
             'python': 'python', 'javascript': 'javascript', 'js': 'javascript',
             'java': 'java', 'shell': 'bash', 'bash': 'bash', 'plain': '',
@@ -43,6 +84,7 @@ def lake_to_markdown(body):
 
     code_blocks = []
     images = []  # (src, link, ext)
+    math_cards = []  # (is_block, code)
 
     # ── 第一步：替换 card 为纯文本占位符 ──
     def replace_codeblock(m):
@@ -53,6 +95,7 @@ def lake_to_markdown(body):
         mode = card_data.get('mode', 'text')
         if '%' in code:
             code = urllib.parse.unquote(code)
+        code = _unescape(code)
         lang = LANG_MAP.get(mode, mode if len(mode) <= 15 else '')
         # 嵌套代码块（code 内部含 ```）会让 Notion markdown 解析错乱吞掉图片行：
         # 直接展开不包外层 fence，让内部 ``` 成为顶层代码块
@@ -89,7 +132,53 @@ def lake_to_markdown(body):
     result = re.sub(
         r'<card[^>]*name="image"[^>]*value="([^"]*)"[^>]*>\s*</card>',
         replace_image, result)
-    result = re.sub(r'</?card[^>]*>', '', result)
+
+    # ── 第一步之二：其它卡片分类处理（不许静默丢掉）──
+    def replace_other_card(m):
+        tag = m.group(0)
+        nm = (NAME_RE.search(tag) or [None, ''])[1].lower()
+        vm = VALUE_RE.search(tag)
+        raw_val = vm.group(1) if vm else ''
+        card_type = ((TYPE_RE.search(tag) or [None, ''])[1] or '').lower()
+
+        if nm == 'hr':
+            return '\n---\n'
+        if nm in ('math', 'formula', 'tex'):
+            d = decode_card_value(raw_val) or {}
+            code = d.get('code', '') or ''
+            if '%' in code:
+                code = urllib.parse.unquote(code)
+            code = _unescape(code).strip()
+            if not code:
+                return ''
+            math_cards.append((card_type == 'block', code))
+            return f'\n\x01MATH{len(math_cards)-1}\x01\n'
+
+        d = decode_card_value(raw_val) or {}
+        url = _unescape(str(d.get('url') or d.get('src') or d.get('link') or '')).strip()
+        title = _unescape(str(d.get('name') or d.get('title') or d.get('text') or '')).strip()
+
+        if nm in ('file', 'attachment', 'localdoc'):
+            return f'\n📎 [{title or "附件"}]({url})\n' if url else f'\n📎 附件：{title or "（无链接）"}\n'
+        if nm in ('bookmark', 'link', 'yuque'):
+            if url:
+                return f'\n[{title or url}]({url})\n'
+            return card_placeholder('bookmark')
+        if nm in ('video', 'iframe', 'audio'):
+            if url:
+                label = '音频' if nm == 'audio' else '视频'
+                return f'\n[{label}]({url})\n'
+            return card_placeholder(nm)
+
+        # 表格/画板/思维导图/未如类型 → 可见占位（内容不静默消失）
+        hint = _unescape((title or str(d.get('code') or '') or ''))[:60].replace('\n', ' ')
+        return card_placeholder(nm, hint)
+
+    result = re.sub(CARD_ANY_RE, replace_other_card, result)
+
+    # 安全网：形状奇特的残留 card 也必须变成可见占位
+    result = re.sub(r'<card\b[^>]*>', lambda m: card_placeholder(_card_name(m.group(0))), result)
+    result = re.sub(r'</card>', '', result)
 
     # ── 第二步：URL 解码 ──
     result = urllib.parse.unquote(result)
@@ -116,9 +205,7 @@ def lake_to_markdown(body):
     result = re.sub(r'<[^>]+>', '', result)
 
     # ── 第四步：清理实体 ──
-    result = result.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-    result = result.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&#39;', "'")
-    result = result.replace('\u200b', '').replace('\xa0', ' ')
+    result = _unescape(result)
     result = re.sub(r'[ \t]+\n', '\n', result)
     result = re.sub(r'\n{3,}', '\n\n\n', result)
 
@@ -141,8 +228,21 @@ def lake_to_markdown(body):
             return f'[![图片]({src})]({link})'
         return f'![图片]({src})'
 
+    def restore_math(m):
+        idx = int(m.group(1))
+        is_block, code = math_cards[idx]
+        multiline = '\n' in code
+        if _looks_latex(code):
+            # 块级或含换行 → 独立公式块（行内 $..$ 不能跨行）
+            return f'\n$$\n{code}\n$$\n' if (is_block or multiline) else f'${code}$'
+        # 不是 LaTeX（实测语雀 math 卡片也装普通代码）→ 代码
+        if multiline:
+            return f'\n```\n{code}\n```\n'
+        return f'`{code}`'
+
     result = re.sub(r'\x01CODEBLOCK(\d+)\x01', restore_codeblock, result)
     result = re.sub(r'\x01IMAGE(\d+)\x01', restore_image, result)
+    result = re.sub(r'\x01MATH(\d+)\x01', restore_math, result)
 
     return result.strip(), [(src, link, ext) for src, link, ext in images]
 
