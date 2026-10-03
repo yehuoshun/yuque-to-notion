@@ -336,11 +336,35 @@ def fetch_existing_pages(yuque_url):
     return out
 
 
+# 子页标题序号后缀（防同名章节对账歧义）。匹配时兼容无序号旧格式。
+_TITLE_STRIP_RE = re.compile(r'（第\d+片）$')
+
+
+def _title_aliases(title):
+    """新格式标题 → [新格式, 旧格式]；旧格式标题 → [旧格式]"""
+    base = _TITLE_STRIP_RE.sub('', title)
+    return (title, base) if base != title else (title,)
+
+
+def _match_title(expected, by_title):
+    """按标题找已存在的页 id。精确匹配按序消费；旧格式匹配必须唯一，
+    歧义（同名章节）→ 返回 None：不复用，宁可新建重复页也不覆盖已有内容。"""
+    for cand in _title_aliases(expected):
+        bucket = by_title.get(cand)
+        if bucket:
+            if cand == expected or len(bucket) == 1:
+                return bucket.pop(0)
+            return None
+    return None
+
+
 def chunk_page_title(doc_title, ci, chapter_title):
-    """分片页标题（建页和后续匹配必须用同一个规则）"""
+    """分片页标题（建页和后续匹配必须用同一个规则）
+    ci>0 带「（第N片）」序号：同一文档内章节名可重复（两个「总结」），
+    标题必须唯一，否则断点重跑对账会把两片映射到同一页 → 覆盖丢数据。"""
     if ci == 0:
         return doc_title[:2000]
-    return f'{doc_title[:60]} - {(chapter_title or "")[:80]}'
+    return f'{doc_title[:60]} - {(chapter_title or "")[:80]}（第{ci + 1}片）'
 
 
 def images_for_chunk(chunk_markdown, img_list):
@@ -914,8 +938,8 @@ for i, entry in enumerate(batch):
 
     by_title = {}
     for p in existing_pages:
-        by_title.setdefault(p.get('title', ''), p.get('id'))
-    found_pages = [by_title.get(t) for t in expected_titles]
+        by_title.setdefault(p.get('title', ''), []).append(p.get('id'))
+    found_pages = [_match_title(t, by_title) for t in expected_titles]
 
     if all(found_pages):
         print(f"  [{idx}] SKIP（Notion 已存在 {len(existing_pages)} 页）- {entry['title'][:50]}")

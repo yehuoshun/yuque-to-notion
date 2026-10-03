@@ -199,6 +199,15 @@ def body_3sections():
             + '\n\n## 第三节\n\n' + '第三节正文内容示例。' * 30)
 
 
+def body_dup_sections():
+    """三个同名章节「总结」+ 一个「附录」→ 4 片（片0=主页面，片1/2 子页标题会撞）；
+    旧逻辑子页标题重复，对账会串页"""
+    return ('## 总结\n\n' + '总结内容示例文字。' * 30
+            + '\n\n## 总结\n\n' + '总结内容示例文字。' * 30
+            + '\n\n## 总结\n\n' + '总结内容示例文字。' * 30
+            + '\n\n## 附录\n\n' + '附录内容示例文字。' * 30)
+
+
 print('== 1. 全新文档：按片数建页（拆分后 page_ids 完整） ==')
 e = Env()
 e.set_body(body_3sections())
@@ -272,12 +281,84 @@ os.environ['YUQUE2NOTION_STATE_DIR'] = tempfile.mkdtemp(prefix='y2n-big-h-')
 os.environ['NOTION_TOKEN'] = 't'
 exec(compile(head, 'h', 'exec'), ns)
 check('chunk_page_title 主页面 = 文档名', ns['chunk_page_title']('标题', 0, '') == '标题', '')
-check('chunk_page_title 子页 = 文档名 - 章节',
-      ns['chunk_page_title']('标题', 1, '章节A') == '标题 - 章节A', '')
+check('chunk_page_title 子页 = 文档名 - 章节（第N片）',
+      ns['chunk_page_title']('标题', 1, '章节A') == '标题 - 章节A（第2片）', '')
 md = '前![图片](https://n2m.local/img_0.png)中 ![图片](https://n2m.local/img_3.png)后'
 imgs = [('a', '', 'png'), ('b', '', 'png'), ('c', '', 'png'), ('d', '', 'png')]
 sub = ns['images_for_chunk'](md, imgs)
 check('images_for_chunk 只取本片图且保留原下标', [x[0] for x in sub] == [0, 3], str([x[0] for x in sub]))
+
+print('\n== 6. 同名章节：子页标题带序号，首次迁移不冲突 ==')
+e = Env()
+e.set_body(body_dup_sections())
+r = e.run()
+res = e.results()[0] if e.results() else {}
+check('exit 0', r.returncode == 0, r.stderr[-200:] if r.returncode else '')
+check('拆成 4 片', res.get('chunks_total') == 4, str(res.get('chunks_total')))
+check('建了 4 页', len(e.created()) == 4, f'created={len(e.created())}')
+check('状态 OK', res.get('status') == 'OK', str(res.get('status')))
+titles = [c['title'] for c in e.created()]
+check('两个同名章节标题带序号且不同',
+      '大文档 - 总结（第2片）' in titles and '大文档 - 总结（第3片）' in titles, str(titles))
+e.cleanup()
+
+print('\n== 7. 同名旧格式页（无序号）：歧义 → 不复用，补建带序号页，旧页不覆盖 ==')
+e = Env()
+e.set_body(body_dup_sections())
+e.set_existing([{'id': 'old0', 'title': '大文档'},
+                {'id': 'old1', 'title': '大文档 - 总结'},
+                {'id': 'old2', 'title': '大文档 - 总结'},
+                {'id': 'old3', 'title': '大文档 - 附录'}])
+r = e.run()
+res = e.results()[0] if e.results() else {}
+created = e.created()
+check('exit 0', r.returncode == 0, r.stderr[-200:] if r.returncode else '')
+check('只补建 2 页（两个歧义的总结片）', len(created) == 2, f'created={len(created)}')
+check('新页标题带序号',
+      sorted(c['title'] for c in created) == ['大文档 - 总结（第2片）', '大文档 - 总结（第3片）'], str(created))
+check('复用主页面 old0', res.get('page_ids', {}).get('0') == 'old0', str(res.get('page_ids')))
+check('复用附录旧页 old3', res.get('page_ids', {}).get('3') == 'old3', str(res.get('page_ids')))
+check('两个歧义片都指向新页（非 old1/old2）',
+      res.get('page_ids', {}).get('1') not in ('old1', 'old2')
+      and res.get('page_ids', {}).get('2') not in ('old1', 'old2'),
+      str(res.get('page_ids')))
+check('状态 OK（片齐了）', res.get('status') == 'OK', str(res.get('status')))
+e.cleanup()
+
+print('\n== 8. 带序号页全在 → 精确匹配 SKIP ==')
+e = Env()
+e.set_body(body_dup_sections())
+e.set_existing([{'id': 'p0', 'title': '大文档'},
+                {'id': 'p1', 'title': '大文档 - 总结（第2片）'},
+                {'id': 'p2', 'title': '大文档 - 总结（第3片）'},
+                {'id': 'p3', 'title': '大文档 - 附录（第4片）'}])
+r = e.run()
+res = e.results()[0] if e.results() else {}
+check('exit 0', r.returncode == 0, '')
+check('SKIP', res.get('status') == 'SKIP', str(res.get('status')))
+check('没建任何页', len(e.created()) == 0, f'created={len(e.created())}')
+check('SKIP 原因 = notion_exists', res.get('reason') == 'notion_exists', str(res.get('reason')))
+e.cleanup()
+
+print('\n== 9. 标题对账 helper 单元 ==')
+ns2 = {}
+src2 = open(os.path.join(SCRIPTS, 'batch_migrate.py')).read()
+head2 = src2.split('# ── 主流程 ──')[0]
+os.environ['YUQUE2NOTION_STATE_DIR'] = tempfile.mkdtemp(prefix='y2n-big-h2-')
+os.environ['NOTION_TOKEN'] = 't'
+exec(compile(head2, 'h', 'exec'), ns2)
+check('chunk_page_title 子页带序号（含中文括号）',
+      ns2['chunk_page_title']('标题', 1, '章节A') == '标题 - 章节A（第2片）', '')
+check('新格式别名 = [新, 旧]',
+      ns2['_title_aliases']('标题 - 章节A（第2片）') == ('标题 - 章节A（第2片）', '标题 - 章节A'), '')
+check('旧格式别名 = [旧]', ns2['_title_aliases']('标题 - 章节A') == ('标题 - 章节A',), '')
+
+def bt():
+    return {'标题 - 章节A（第2片）': ['n1'], '标题 - 章节A': ['o1', 'o2'], '标题 - 章节C': ['u1']}
+
+check('精确匹配优先', ns2['_match_title']('标题 - 章节A（第2片）', bt()) == 'n1', '')
+check('旧格式唯一可复用', ns2['_match_title']('标题 - 章节C（第2片）', bt()) == 'u1', '')
+check('旧格式歧义 → None', ns2['_match_title']('标题 - 章节A（第3片）', bt()) is None, '')
 
 print(f'\n{"=" * 52}\n通过 {len(PASS)} / 失败 {len(FAIL)}')
 for x in FAIL:
