@@ -273,6 +273,8 @@ check('队列去重', st.load_queue(qp) == ['a', 'b'], str(st.load_queue(qp)))
 st.queue_remove(qp, 'a')
 st.queue_remove(qp, 'zz')
 check('队列移除幂等', st.load_queue(qp) == ['b'], str(st.load_queue(qp)))
+st.save_queue(qp, ['x', 'y'])
+check('save_queue 覆盖写', st.load_queue(qp) == ['x', 'y'], str(st.load_queue(qp)))
 shutil.rmtree(qs_root, ignore_errors=True)
 
 print('\n== 9. 指纹函数本身 ==')
@@ -281,6 +283,38 @@ f2 = st.entries_fingerprint([{'doc_id': 2, 'title': 'y'}, {'doc_id': 1, 'title':
 f3 = st.entries_fingerprint([{'doc_id': 1, 'title': 'x'}, {'doc_id': 2, 'title': 'y'}])
 check('顺序不同 → 指纹不同', f1 != f2, f'{f1} vs {f2}')
 check('相同清单 → 指纹相同', f1 == f3, f1)
+
+print('\n== 10. --mode new：清单变了也不卡指纹，直接全量重扫 ==')
+e = Env()
+e.run()   # 建 job：游标 10，结果 10 条（doc_id 1000..1009）
+changed = list(reversed(e.entries))      # 顺序变 → 指纹变
+n_changed = len(changed)
+e.write_entries(changed)
+r = e.run('--mode', 'new')
+job = e.cursor()
+check('exit 0（不再被指纹卡死）', r.returncode == 0, r.stderr[-200:] if r.returncode else '')
+check('从 0 开始全量重扫', 'BATCH: 0-9/25' in r.stdout,
+      [l for l in r.stdout.splitlines() if l.startswith('BATCH')][:1])
+check('指纹更新为当前清单',
+      job and job['entries_fingerprint'] == st.entries_fingerprint(changed),
+      str(job and job['entries_fingerprint']))
+check('旧账清空、按新清单重跑（doc_id 1015..1024）',
+      {str(x['doc_id']) for x in e.results()} == {str(1000 + i) for i in range(15, 25)},
+      str(sorted({x['doc_id'] for x in e.results()})))
+check('重试队列保持空', st.load_queue(os.path.join(e.state, 'retry_queue.json')) == [], '')
+e.cleanup()
+
+print('\n== 11. --mode new --dry-run：零副作用预览 ==')
+e = Env()
+e.run()   # 建 job：游标 10，结果 10 条
+before_prog = open(os.path.join(e.state, 'progress.json')).read()
+r = e.run('--mode', 'new', '--dry-run')
+check('exit 0', r.returncode == 0, r.stderr[-200:] if r.returncode else '')
+check('预览从 0 开始', 'BATCH: 0-9/25' in r.stdout,
+      [l for l in r.stdout.splitlines() if l.startswith('BATCH')][:1])
+check('prev_results.json 原样保留（10 条）', len(e.results()) == 10, str(len(e.results())))
+check('progress.json 未被改写', open(os.path.join(e.state, 'progress.json')).read() == before_prog, '')
+e.cleanup()
 
 print(f'\n{"=" * 52}\n通过 {len(PASS)} / 失败 {len(FAIL)}')
 for x in FAIL:

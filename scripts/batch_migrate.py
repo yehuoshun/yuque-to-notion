@@ -723,7 +723,7 @@ def extract_tags(title, body, source, category):
 # ── 主流程 ──
 # MODE 已由 cli 在开头解析（支持 --mode，也兼容旧的裸 `new|resume|retry-failed`）
 
-if MODE == 'new':
+if MODE == 'new' and not S.dry_run:
     for f in [PROGRESS_FILE, PREV_RESULTS_FILE]:
         if os.path.exists(f):
             os.remove(f)
@@ -784,22 +784,33 @@ if job is None:
     st.save_progress(PROGRESS_JSON, progress)
     print(f'[progress] 新建任务 {JOB_KEY}（{len(entries)} 篇）')
 else:
-    fp_changed = bool(job.get('entries_fingerprint')) and job['entries_fingerprint'] != ENTRY_FP
-    if fp_changed and not S.reset_cursor:
-        print('[FATAL] 条目清单变了，与进度记录对不上：')
-        print(f"[FATAL]   进度内: {job['entries_fingerprint']}（{job.get('entries_count')} 篇）")
-        print(f"[FATAL]   当前:   {ENTRY_FP}（{len(entries)} 篇）")
-        print('[FATAL] 清单顺序变了却沿用旧游标会静默漏篇。确认要重扫这份清单就加 --reset-cursor')
-        sys.exit(2)
-    if fp_changed:
-        print('[progress] --reset-cursor：清单指纹已变更，游标归零重扫')
-    elif S.reset_cursor:
-        print('[progress] --reset-cursor：游标归零')
-    if S.reset_cursor or fp_changed:
-        st.update_cursor(progress, JOB_KEY, 0, allow_decrease=True)
-        job['entries_fingerprint'] = ENTRY_FP
-        job['entries_count'] = len(entries)
-        st.save_progress(PROGRESS_JSON, progress)
+    if MODE == 'new':
+        # --mode new 语义 = 全量重扫：直接重建任务进度，不校验指纹（无需 --reset-cursor）
+        if not S.dry_run:
+            job['cursor'] = 0
+            job['entries_fingerprint'] = ENTRY_FP
+            job['entries_count'] = len(entries)
+            job['updated_at'] = st.now_iso()
+            job['last_batch'] = {}
+            st.save_progress(PROGRESS_JSON, progress)
+            print('[mode=new] 任务进度已重置（游标 0，指纹更新为当前清单）')
+    else:
+        fp_changed = bool(job.get('entries_fingerprint')) and job['entries_fingerprint'] != ENTRY_FP
+        if fp_changed and not S.reset_cursor:
+            print('[FATAL] 条目清单变了，与进度记录对不上：')
+            print(f"[FATAL]   进度内: {job['entries_fingerprint']}（{job.get('entries_count')} 篇）")
+            print(f"[FATAL]   当前:   {ENTRY_FP}（{len(entries)} 篇）")
+            print('[FATAL] 清单顺序变了却沿用旧游标会静默漏篇。确认要重扫这份清单就加 --reset-cursor')
+            sys.exit(2)
+        if fp_changed:
+            print('[progress] --reset-cursor：清单指纹已变更，游标归零重扫')
+        elif S.reset_cursor:
+            print('[progress] --reset-cursor：游标归零')
+        if S.reset_cursor or fp_changed:
+            st.update_cursor(progress, JOB_KEY, 0, allow_decrease=True)
+            job['entries_fingerprint'] = ENTRY_FP
+            job['entries_count'] = len(entries)
+            st.save_progress(PROGRESS_JSON, progress)
 
 start_idx = int(st.get_job(progress, JOB_KEY).get('cursor', 0))
 
@@ -811,10 +822,11 @@ processed_ids = {str(r.get('doc_id')) for r in merged_records if r.get('status')
 batch_start_cursor = start_idx
 if MODE == 'new':
     print('[mode=new] 重置进度 / 结果 / 重试队列')
-    st.update_cursor(progress, JOB_KEY, 0, allow_decrease=True)
-    st.save_progress(PROGRESS_JSON, progress)
-    st.save_results(PREV_RESULTS_FILE, [])
-    st.save_queue(RETRY_QUEUE_FILE, [])
+    if not S.dry_run:
+        st.update_cursor(progress, JOB_KEY, 0, allow_decrease=True)
+        st.save_progress(PROGRESS_JSON, progress)
+        st.save_results(PREV_RESULTS_FILE, [])
+        st.save_queue(RETRY_QUEUE_FILE, [])
     processed_ids = set()
     start_idx = batch_start_cursor = 0
     end_idx = min(BATCH_SIZE, len(entries))

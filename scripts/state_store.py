@@ -147,6 +147,13 @@ def load_queue(path):
     return _read_json(path, [])
 
 
+def save_queue(path, doc_ids):
+    """覆盖写队列（--mode new 重置用）。"""
+    q = [str(x) for x in doc_ids]
+    _write_json(path, q)
+    return q
+
+
 def queue_add(path, doc_ids):
     q = load_queue(path)
     seen = {str(x) for x in q}
