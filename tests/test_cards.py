@@ -117,6 +117,16 @@ md = conv(card('math', {'code': '\\alpha\n\\beta'}, 'inline'))
 check('多行 LaTeX 行内卡 → 独立 $$ 块', '$$\n\\alpha\n\\beta\n$$' in md, md.replace('\n', '⏎'))
 check('单行 LaTeX 仍是行内 $', '$\\alpha$' in conv(card('math', {'code': '\\alpha'})), '')
 
+print('\n== N. URL 编码字面量不再被二次/整体解码 ==')
+md = conv(card('codeblock', {'code': 'a%E4%B8%AD b%20c', 'mode': 'text'}))
+check('codeblock 内 %xx 字面量原样保留', 'a%E4%B8%AD b%20c' in md, md.replace('\n', '⏎'))
+md = conv(card('math', {'code': 'x%2Fy'}))
+check('math 内 %xx 原样保留', 'x%2Fy' in md, md.replace('\n', '⏎'))
+md, _ = lake_to_markdown("<p>LIKE '%20%' 是 SQL 通配符</p>")
+check('正文 %xx 原样保留（不被整体解码）', "%20%" in md and 'LIKE' in md, md)
+md, _ = lake_to_markdown('<a href="/note/04-%E6%96%87%E6%9C%AC%E7%9B%B8%E5%85%B3.html">文</a>')
+check('链接 href 保持 URL 编码形态', '/note/04-%E6%96%87%E6%9C%AC%E7%9B%B8%E5%85%B3.html' in md, md)
+
 print(f'\n{"=" * 52}\n通过 {len(PASS)} / 失败 {len(FAIL)}')
 for x in FAIL:
     print('  ❌ ' + x)

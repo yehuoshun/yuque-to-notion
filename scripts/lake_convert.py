@@ -124,8 +124,6 @@ def lake_to_markdown(body):
             return ''
         code = card_data.get('code', '')
         mode = card_data.get('mode', 'text')
-        if '%' in code:
-            code = urllib.parse.unquote(code)
         code = _unescape(code)
         lang = LANG_MAP.get(mode, mode if len(mode) <= 15 else '')
         # 嵌套代码块（code 内部含 ```）会让 Notion markdown 解析错乱吞掉图片行：
@@ -177,8 +175,6 @@ def lake_to_markdown(body):
         if nm in ('math', 'formula', 'tex'):
             d = decode_card_value(raw_val) or {}
             code = d.get('code', '') or ''
-            if '%' in code:
-                code = urllib.parse.unquote(code)
             code = _unescape(code).strip()
             if not code:
                 return ''
@@ -210,9 +206,6 @@ def lake_to_markdown(body):
     # 安全网：形状奇特的残留 card 也必须变成可见占位
     result = re.sub(r'<card\b[^>]*>', lambda m: card_placeholder(_card_name(m.group(0))), result)
     result = re.sub(r'</card>', '', result)
-
-    # ── 第二步：URL 解码 ──
-    result = urllib.parse.unquote(result)
 
     # ── 第三步：HTML → Markdown ──
     result = re.sub(r'<h1[^>]*>(.*?)</h1>', lambda m: f"\n# {strip_tags(m.group(1))}\n", result, flags=re.DOTALL)

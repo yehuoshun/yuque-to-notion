@@ -183,7 +183,7 @@ python3 scripts/batch_migrate.py --mode retry-failed
 
 ## 测试
 
-219 项，**全离线**（假 `mcporter` + `sitecustomize` 拦掉网络与 sleep），不需要真库、不写任何数据：
+223 项，**全离线**（假 `mcporter` + `sitecustomize` 拦掉网络与 sleep），不需要真库、不写任何数据：
 
 ```bash
 python3 tests/test_settings.py      # 配置优先级 / 各脚本开关子集 / fail-fast
