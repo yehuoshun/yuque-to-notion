@@ -127,7 +127,7 @@ def notion_upload_images(img_items):
                     headers=NOTION_HEADERS,
                     json={'mode': 'single_part', 'filename': f'img_{i}.{ext}', 'content_type': f'image/{ext}'},
                     timeout=60)
-            except Exception as e:
+            except Exception:
                 r1 = None
             if r1 is not None and r1.status_code in (200, 201):
                 break
@@ -174,7 +174,7 @@ def notion_attach_images(page_id, upload_map, markdown):
             headers=NOTION_HEADERS, timeout=60)
     except Exception as e:
         print(f"    [img] 读 blocks 异常 {e}")
-        return 0, [f'read:exc']
+        return 0, ['read:exc']
     if r.status_code != 200:
         print(f"    [img] 读 blocks 失败 {r.status_code}")
         return 0, [f'read:{r.status_code}']
@@ -215,6 +215,10 @@ def mcpcall(tool, args, retries=3):
     for attempt in range(retries):
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=45, cwd=MCP_CWD)
+            if r.returncode != 0:
+                print(f'    [mcp] {tool} 退出码 {r.returncode}: {(r.stderr or "").strip()[:120]}, 重试 {attempt+1}/{retries}...')
+                time.sleep(3)
+                continue
             data = json.loads(r.stdout)
             # 判断错误：isError 标志 / error 键（含 Unknown MCP server）/ status>=400
             if isinstance(data, dict):
@@ -249,8 +253,12 @@ def fetch_doc_with_retry(entry, book_id, max_retries=2):
             continue
         if result.get('body'):
             return result, None
+        # body 空但 word_count=0 → 真·空文档（不是风控），交给 precheck 判 SKIP；
+        # 否则疑似风控 → 重试（风控响应的 word_count 仍为真实值）
+        if result.get('word_count', 1) == 0:
+            return result, None
         if attempt == 0:
-            print(f"    [retry] body 空（疑似风控）, 等 30s 后重试")
+            print("    [retry] body 空（疑似风控）, 等 30s 后重试")
             time.sleep(30)
         else:
             print(f"    [retry] body 仍空, 等 60s 后重试 ({attempt+1}/{max_retries})")
@@ -1048,7 +1056,7 @@ for i, entry in enumerate(batch):
 
     print(f"        原文链接: {yuque_url}")
     if unsupported:
-        print(f"        ⚠ 未转换卡片: " + ', '.join(f'{k}×{v}' for k, v in unsupported.items()))
+        print("        ⚠ 未转换卡片: " + ', '.join(f'{k}×{v}' for k, v in unsupported.items()))
     if url:
         print(f"        备注: 原文出处: {url}")
 

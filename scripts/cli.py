@@ -237,7 +237,6 @@ def load_settings(argv=None, prog='batch_migrate', require=('notion', 'book')):
     entries_file = args.entries or os.path.join(state_dir, 'yuque_entries.json')
     src['entries_file'] = '命令行' if args.entries else 'state-dir 派生'
     src['progress_file'] = src['prev_results_file'] = 'state-dir 派生'
-    src['notion_ds_id'] = src['notion_ds_id']
     src['notion_token'] = '环境变量 NOTION_TOKEN' if os.environ.get('NOTION_TOKEN') \
         else f'凭据文件 {os.path.basename(env_file)}'
     src.setdefault('dry_run', '命令行' if args.dry_run else '内置默认')

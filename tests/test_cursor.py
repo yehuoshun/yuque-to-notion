@@ -316,6 +316,17 @@ check('prev_results.json 原样保留（10 条）', len(e.results()) == 10, str(
 check('progress.json 未被改写', open(os.path.join(e.state, 'progress.json')).read() == before_prog, '')
 e.cleanup()
 
+print('\n== 12. 真空正文文档：不再误判 RATE_LIMITED，直接 SKIP ==')
+e = Env()
+r = e.run(env_extra={'FAKE_FAIL_IDS': '1000'})   # doc 1000 空 body + word_count=0
+res = e.results()
+check('exit 0', r.returncode == 0, r.stderr[-200:] if r.returncode else '')
+check('空文档 SKIP（R8_空body）', bool(res) and res[0]['status'] == 'SKIP', str(res and res[0]['status']))
+check('没进重试队列', st.load_queue(os.path.join(e.state, 'retry_queue.json')) == [], '')
+check('游标推进（不卡死）', e.cursor() and e.cursor()['cursor'] == 10,
+      str(e.cursor() and e.cursor()['cursor']))
+e.cleanup()
+
 print(f'\n{"=" * 52}\n通过 {len(PASS)} / 失败 {len(FAIL)}')
 for x in FAIL:
     print('  ❌ ' + x)

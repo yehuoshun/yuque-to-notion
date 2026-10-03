@@ -11,7 +11,7 @@ import sys
 import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
-from lake_convert import _ext_from_src, _sniff_ext, lake_to_markdown  # noqa: E402
+from lake_convert import _ext_from_src, lake_to_markdown  # noqa: E402
 
 PASS, FAIL = [], []
 
