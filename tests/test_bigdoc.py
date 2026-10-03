@@ -284,7 +284,7 @@ check('chunk_page_title 主页面 = 文档名', ns['chunk_page_title']('标题',
 check('chunk_page_title 子页 = 文档名 - 章节（第N片）',
       ns['chunk_page_title']('标题', 1, '章节A') == '标题 - 章节A（第2片）', '')
 md = '前![图片](https://n2m.local/img_0.png)中 ![图片](https://n2m.local/img_3.png)后'
-imgs = [('a', '', 'png'), ('b', '', 'png'), ('c', '', 'png'), ('d', '', 'png')]
+imgs = [(0, 'a', '', 'png'), (1, 'b', '', 'png'), (2, 'c', '', 'png'), (3, 'd', '', 'png')]
 sub = ns['images_for_chunk'](md, imgs)
 check('images_for_chunk 只取本片图且保留原下标', [x[0] for x in sub] == [0, 3], str([x[0] for x in sub]))
 

@@ -70,7 +70,7 @@ raw = b'RIFF\xe6\x0a\x00\x00WEBPVP8 ' + pad(80)
 card = ('<card type="inline" name="image" value="data:'
         + urllib.parse.quote(json.dumps({'src': data_uri(raw, 'png'), 'link': ''})) + '"></card>')
 md, imgs = lake_to_markdown(f'<p>图：</p>{card}')
-check('图片元数据 ext = webp', imgs and imgs[0][2] == 'webp', str(imgs[0][2] if imgs else None))
+check('图片元数据 ext = webp', imgs and imgs[0][3] == 'webp', str(imgs[0][3] if imgs else None))
 check('占位 URL 带 .webp', 'n2m.local/img_0.webp' in md, md.replace('\n', '⏎')[:80])
 
 print('\n== 7. 真实文档回归（那张实际是 WEBP 的图） ==')
@@ -78,7 +78,7 @@ p = '/home/admin/.openclaw/workspace/tmp/doc_269354748.json'
 if os.path.exists(p):
     body = json.load(open(p))['body']
     md, imgs = lake_to_markdown(body)
-    ext = imgs[0][2] if imgs else None
+    ext = imgs[0][3] if imgs else None
     check('真实图嗅探为 webp（声明是 png）', ext == 'webp', f'ext={ext}')
     check('占位 URL 与之一致', 'img_0.webp' in md, '')
 else:

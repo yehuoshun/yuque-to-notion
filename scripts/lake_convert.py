@@ -152,7 +152,7 @@ def lake_to_markdown(body):
             return '\n[图片]\n'
         src = card_data.get('src', '')
         link = card_data.get('link', '')
-        images.append((src, link, _ext_from_src(src)))
+        images.append((len(images), src, link, _ext_from_src(src)))
         return f'\n\x01IMAGE{len(images)-1}\x01\n'
 
     result = re.sub(
@@ -242,7 +242,7 @@ def lake_to_markdown(body):
 
     def restore_image(m):
         idx = int(m.group(1))
-        src, link, ext = images[idx]
+        _i, src, link, ext = images[idx]
         if not src:
             return '[图片]'
         if src.startswith('data:image/'):
@@ -268,7 +268,7 @@ def lake_to_markdown(body):
     result = re.sub(r'\x01IMAGE(\d+)\x01', restore_image, result)
     result = re.sub(r'\x01MATH(\d+)\x01', restore_math, result)
 
-    return result.strip(), [(src, link, ext) for src, link, ext in images]
+    return result.strip(), list(images)
 
 def strip_tags(html):
     return re.sub(r'<[^>]+>', '', html).strip()

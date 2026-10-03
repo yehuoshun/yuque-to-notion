@@ -368,9 +368,11 @@ def chunk_page_title(doc_title, ci, chapter_title):
 
 
 def images_for_chunk(chunk_markdown, img_list):
-    """本片用到的图片子集（按片内 n2m.local/img_N 占位取），保留原下标"""
+    """本片用到的图片子集（按片内 n2m.local/img_N 占位取），保留原下标。
+    img_list 元素 = (原占位下标, src, link, ext)，下标与占位 URL 一一对应，
+    不依赖 enumerate 巧合（列表一旦变稀疏/过滤，enumerate 会错位传图）。"""
     idxs = {int(m) for m in re.findall(r'n2m\.local/img_(\d+)\.', chunk_markdown or '')}
-    return [(i, s, l, e) for i, (s, l, e) in enumerate(img_list or []) if i in idxs]
+    return [(i, s, l, e) for (i, s, l, e) in (img_list or []) if i in idxs]
 
 
 # ── 标题/围栏识别 ──
